@@ -11,6 +11,7 @@ import argparse
 import random
 import time
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 torch.set_num_threads(8)
 import torch.optim as optim
@@ -95,9 +96,16 @@ class EEG_Encoder_Module(pl.LightningModule):
         super().__init__()
         self.config = config
         self.model = Tower(config)
-        self.loss = nn.CrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss()
         self.cosine_lr_list = cosine_scheduler(1, 0.1, max_epochs, niter_per_ep, warmup_epochs=10)
-        self.accuracy = torchmetrics.Accuracy('multiclass', num_classes = config.n_classes)
+        self.accuracy = torchmetrics.Accuracy('multiclass', num_classes=config.n_classes)
+        
+        # Track metrics for learning curve
+        self.train_losses = []
+        self.train_accs = []
+        self.epoch_loss = 0.0
+        self.epoch_correct = 0
+        self.epoch_total = 0
 
     def configure_optimizers(self):
         self.optimizer = optim.AdamW(self.parameters(), lr=0.0005)
@@ -107,13 +115,123 @@ class EEG_Encoder_Module(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
         pred = self.model(x)
-        return self.loss(pred, y)
+        loss = self.loss_fn(pred, y)
+        
+        # Track batch metrics
+        with torch.no_grad():
+            preds = torch.argmax(pred, dim=1)
+            correct = (preds == y).sum().item()
+            self.epoch_loss += loss.item() * x.size(0)
+            self.epoch_correct += correct
+            self.epoch_total += x.size(0)
+        
+        # Log loss for progress bar
+        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=False)
+        return loss
+    
+    def on_train_epoch_end(self):
+        # Calculate epoch metrics
+        avg_loss = self.epoch_loss / max(self.epoch_total, 1)
+        avg_acc = self.epoch_correct / max(self.epoch_total, 1)
+        
+        self.train_losses.append(avg_loss)
+        self.train_accs.append(avg_acc)
+        
+        # Reset for next epoch
+        self.epoch_loss = 0.0
+        self.epoch_correct = 0
+        self.epoch_total = 0
 
-def Finetune(config, Data_X, Data_Y, logf, max_epochs=200, ckpt_pretrain=None):
+
+class LearningCurveCallback(pl.Callback):
+    """Callback to display live training progress."""
+    
+    def __init__(self, max_epochs, fold_info=""):
+        super().__init__()
+        self.max_epochs = max_epochs
+        self.fold_info = fold_info
+        self.start_time = None
+    
+    def on_train_start(self, trainer, pl_module):
+        self.start_time = time.time()
+        print(f"\n{'='*60}")
+        print(f"Training Started {self.fold_info}")
+        print(f"{'='*60}")
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch + 1
+        elapsed = time.time() - self.start_time
+        
+        if len(pl_module.train_losses) > 0:
+            loss = pl_module.train_losses[-1]
+            acc = pl_module.train_accs[-1]
+            lr = trainer.optimizers[0].param_groups[0]['lr']
+            
+            # Calculate ETA
+            avg_time_per_epoch = elapsed / epoch
+            remaining_epochs = self.max_epochs - epoch
+            eta = avg_time_per_epoch * remaining_epochs
+            
+            # Progress bar
+            progress = epoch / self.max_epochs
+            bar_len = 30
+            filled = int(bar_len * progress)
+            bar = '█' * filled + '░' * (bar_len - filled)
+            
+            print(f"Epoch {epoch:3d}/{self.max_epochs} |{bar}| "
+                  f"Loss: {loss:.4f} | Acc: {acc*100:.1f}% | "
+                  f"LR: {lr:.2e} | ETA: {eta:.0f}s")
+    
+    def on_train_end(self, trainer, pl_module):
+        total_time = time.time() - self.start_time
+        print(f"{'='*60}")
+        print(f"Training Complete! Total time: {total_time:.1f}s ({total_time/60:.1f}min)")
+        if len(pl_module.train_losses) > 0:
+            print(f"Final Loss: {pl_module.train_losses[-1]:.4f} | "
+                  f"Final Acc: {pl_module.train_accs[-1]*100:.1f}%")
+        print(f"{'='*60}\n")
+
+
+def save_learning_curve(train_losses, train_accs, save_path):
+    """Save learning curve plot to file."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    epochs = range(1, len(train_losses) + 1)
+    
+    # Loss curve
+    ax1.plot(epochs, train_losses, 'b-', linewidth=2, label='Training Loss')
+    ax1.set_xlabel('Epoch', fontsize=11)
+    ax1.set_ylabel('Loss', fontsize=11)
+    ax1.set_title('Training Loss Curve', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    
+    # Accuracy curve
+    train_accs_pct = [acc * 100 for acc in train_accs]
+    ax2.plot(epochs, train_accs_pct, 'g-', linewidth=2, label='Training Accuracy')
+    ax2.set_xlabel('Epoch', fontsize=11)
+    ax2.set_ylabel('Accuracy (%)', fontsize=11)
+    ax2.set_title('Training Accuracy Curve', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    ax2.set_ylim([0, 105])
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Learning curve saved to: {save_path}")
+
+def Finetune(config, Data_X, Data_Y, logf, max_epochs=200, ckpt_pretrain=None, gpu=0):
     seed_all(42)
     Pred, Real = [], []
+    all_fold_losses = []
+    all_fold_accs = []
+    
     kf = KFold(n_splits=5, shuffle=False)
+    fold_num = 0
+    
     for _train_idx, _test_idx in kf.split(Data_X):
+        fold_num += 1
         x_train, y_train = Data_X[_train_idx], Data_Y[_train_idx]
         x_test, y_test = Data_X[_test_idx], Data_Y[_test_idx]
 
@@ -126,21 +244,56 @@ def Finetune(config, Data_X, Data_Y, logf, max_epochs=200, ckpt_pretrain=None):
         if ckpt_pretrain is not None:
             model.model.load_state_dict(torch.load(ckpt_pretrain, weights_only=True))
 
-        print(yellow(logf), green(ckpt_pretrain), x_train.shape, y_train.shape, x_test.shape, y_test.shape)
-        trainer = pl.Trainer(strategy='auto', accelerator='gpu', devices=[args.gpu], max_epochs=max_epochs, callbacks=[], 
-                            enable_progress_bar=False, enable_checkpointing=False, precision='bf16-mixed', logger=False)
+        print(f"\n{yellow(logf)} | {green(str(ckpt_pretrain))}")
+        print(f"Train: {x_train.shape} | Test: {x_test.shape} | Labels: {y_train.shape}")
+        
+        # Setup callback for live logging
+        fold_info = f"[K-Fold {fold_num}/5, Test indices: {_test_idx[0]}-{_test_idx[-1]}]"
+        learning_curve_callback = LearningCurveCallback(max_epochs, fold_info)
+        
+        trainer = pl.Trainer(
+            strategy='auto', 
+            accelerator='gpu', 
+            devices=[gpu], 
+            max_epochs=max_epochs, 
+            callbacks=[learning_curve_callback], 
+            enable_progress_bar=False,  # We use custom logging instead
+            enable_checkpointing=False, 
+            precision='bf16-mixed', 
+            logger=False
+        )
         trainer.fit(model, train_dataloaders=train_loader)
+        
+        # Store metrics for this fold
+        all_fold_losses.append(model.train_losses)
+        all_fold_accs.append(model.train_accs)
 
         # Save the underlying model weights for SHAP analysis
         model_save_dir = os.path.dirname(logf)
         torch.save(model.model.state_dict(), f"{model_save_dir}/{_test_idx[0]}_model.pth")
+        
+        # Save learning curve for this fold
+        curve_path = f"{model_save_dir}/{_test_idx[0]}_learning_curve.png"
+        save_learning_curve(model.train_losses, model.train_accs, curve_path)
 
         # Test data is used only once
         pred, real = inference_on_loader(model.model, test_loader)
+        test_acc = np.mean(pred == real)
+        print(f"K-Fold {fold_num} Test Accuracy: {test_acc*100:.2f}%")
+        
         Pred.append(pred)
         Real.append(real)
+    
     Pred, Real = np.concatenate(Pred), np.concatenate(Real)
     np.savetxt(logf, np.array([Pred, Real]).T, delimiter=',', fmt='%d')
+    
+    # Save combined learning curve (average across folds)
+    if all_fold_losses:
+        avg_losses = np.mean(all_fold_losses, axis=0)
+        avg_accs = np.mean(all_fold_accs, axis=0)
+        combined_curve_path = logf.replace('.csv', '_learning_curve.png')
+        save_learning_curve(avg_losses.tolist(), avg_accs.tolist(), combined_curve_path)
+        print(f"\nCombined learning curve saved to: {combined_curve_path}")
 
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
@@ -181,7 +334,7 @@ if __name__ == '__main__':
         if os.path.exists(flog):
             print(f"Skip {flog}")
             continue
-        Finetune(config, X[fold], Y[fold], flog, max_epochs=200)
+        Finetune(config, X[fold], Y[fold], flog, max_epochs=200, gpu=args.gpu)
 
     accuracy = []
     for fold in range(15):
