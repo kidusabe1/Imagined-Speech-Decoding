@@ -150,6 +150,20 @@ def run_shap_analysis(model, X_background, X_test):
     # Returns list of arrays (one per class)
     shap_values = eeg_explainer.shap_values(X_test)
     
+    # ==================== INSERT THIS FIX ====================
+    # FIX: Check if SHAP returns (Channels, Time, Batch) instead of (Batch, Channels, Time)
+    # We know batch size is len(X_test) (e.g., 5)
+    expected_batch = len(X_test)
+    
+    # If the first dimension is NOT the batch size, but the last one IS:
+    if shap_values[0].shape[0] != expected_batch and shap_values[0].shape[-1] == expected_batch:
+        print(f"\n⚠️  Detected transposed SHAP values {shap_values[0].shape}.")
+        print("   -> Transposing from (Channels, Time, Batch) to (Batch, Channels, Time)...")
+        # Transpose (2, 0, 1) moves the last dim (Batch) to the front
+        shap_values = [np.transpose(s, (2, 0, 1)) for s in shap_values]
+        print(f"   -> New shape: {shap_values[0].shape}")
+    # =========================================================
+    
     print(f"SHAP computation complete!")
     print(f"  Number of classes: {len(shap_values)}")
     print(f"  SHAP values shape per class: {shap_values[0].shape}")
@@ -385,6 +399,20 @@ def main():
         n_bg=args.n_bg, 
         n_test=args.n_test
     )
+    
+    # ==================== INSERT THIS FIX ====================
+    # PATCH: Ensure Electrodes list matches data dimensions
+    actual_n_channels = X_explain.shape[1] # Should be 64
+    
+    if len(Electrodes) < actual_n_channels:
+        print(f"\n⚠️  WARNING: Mismatch detected!")
+        print(f"   Data Channels: {actual_n_channels}")
+        print(f"   Electrode Names: {len(Electrodes)}")
+        print("   -> Padding Electrodes list with placeholders to prevent crash.")
+        
+        # Add placeholders for the extra channels
+        for i in range(len(Electrodes), actual_n_channels):
+            Electrodes.append(f"Unk_Ch{i}")
     
     # 3. Load trained model
     print("\n[Step 2/4] Loading trained model...")
