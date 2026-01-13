@@ -12,6 +12,7 @@ import random
 import time
 import numpy as np
 import torch
+import matplotlib.pyplot as plt  # Added for plotting
 torch.set_num_threads(8)
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -21,14 +22,32 @@ import logging
 import h5py
 import einops
 from sklearn.model_selection import KFold
+from sklearn.metrics import accuracy_score, f1_score # Added for explicit metric calculation
 from transformers import PretrainedConfig
 import lightning as pl
+from lightning.pytorch.callbacks import Callback # Added for history tracking
 logging.getLogger('pytorch_lightning').setLevel(logging.WARNING)
 logging.getLogger('lightning').setLevel(logging.WARNING)
 
 from FAST import FAST as Tower
 from utils import green, yellow
 from BCIC2020Track3_preprocess import Electrodes, Zones
+
+# --- 1. Custom Callback for Learning Curve ---
+class HistoryCallback(Callback):
+    """Captures loss and metrics at the end of every epoch."""
+    def __init__(self):
+        self.history = {'loss': [], 'acc': []}
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        # Retrieve metrics logged in training_step
+        loss = trainer.callback_metrics.get('train_loss')
+        acc = trainer.callback_metrics.get('train_acc')
+        
+        if loss is not None:
+            self.history['loss'].append(loss.item())
+        if acc is not None:
+            self.history['acc'].append(acc.item())
 
 def seed_all(seed):
     random.seed(seed)
@@ -97,7 +116,10 @@ class EEG_Encoder_Module(pl.LightningModule):
         self.model = Tower(config)
         self.loss = nn.CrossEntropyLoss()
         self.cosine_lr_list = cosine_scheduler(1, 0.1, max_epochs, niter_per_ep, warmup_epochs=10)
-        self.accuracy = torchmetrics.Accuracy('multiclass', num_classes = config.n_classes)
+        
+        # Metrics tracking during training
+        self.train_acc = torchmetrics.Accuracy('multiclass', num_classes=config.n_classes)
+        self.train_f1  = torchmetrics.F1Score('multiclass', num_classes=config.n_classes, average='macro')
 
     def configure_optimizers(self):
         self.optimizer = optim.AdamW(self.parameters(), lr=0.0005)
@@ -106,39 +128,108 @@ class EEG_Encoder_Module(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        pred = self.model(x)
-        return self.loss(pred, y)
+        logits = self.model(x)
+        loss = self.loss(logits, y)
+        
+        # Log metrics for the callback
+        acc = self.train_acc(logits, y)
+        f1 = self.train_f1(logits, y)
+        
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_acc', acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_f1', f1, on_step=False, on_epoch=True, prog_bar=True)
+        
+        return loss
 
-def Finetune(config, Data_X, Data_Y, logf, max_epochs=200, ckpt_pretrain=None):
+def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pretrain=None):
+    """
+    Train per subject, report metrics, and save learning curve.
+    """
     seed_all(42)
     Pred, Real = [], []
     kf = KFold(n_splits=5, shuffle=False)
+    
+    # Store history for all 5 folds to plot average later
+    fold_histories = []
+
+    fold_idx = 0
     for _train_idx, _test_idx in kf.split(Data_X):
         x_train, y_train = Data_X[_train_idx], Data_Y[_train_idx]
         x_test, y_test = Data_X[_test_idx], Data_Y[_test_idx]
 
         train_data = BasicDataset(x_train, y_train)
-        train_loader = DataLoader(train_data, batch_size=len(x_train), shuffle=True, num_workers=0, pin_memory=True)
+        # Increased workers to 4 for better GPU saturation
+        train_loader = DataLoader(train_data, batch_size=len(x_train), shuffle=True, num_workers=4, pin_memory=True)
         test_data = BasicDataset(x_test, y_test)
-        test_loader = DataLoader(test_data, batch_size=len(x_test), shuffle=False, num_workers=0, pin_memory=True)
+        test_loader = DataLoader(test_data, batch_size=len(x_test), shuffle=False, num_workers=4, pin_memory=True)
 
         model = EEG_Encoder_Module(config, max_epochs, len(train_loader))
         if ckpt_pretrain is not None:
             model.model.load_state_dict(torch.load(ckpt_pretrain, weights_only=True))
 
-        print(yellow(logf), green(ckpt_pretrain), x_train.shape, y_train.shape, x_test.shape, y_test.shape)
-        trainer = pl.Trainer(strategy='auto', accelerator='gpu', devices=[args.gpu], max_epochs=max_epochs, callbacks=[], 
-                            enable_progress_bar=False, enable_checkpointing=False, precision='bf16-mixed', logger=False)
+        print(f"Fold {fold_idx+1}/5 | {yellow(logf)} | Train: {x_train.shape} | Test: {x_test.shape}")
+        
+        # Attach history callback
+        history_cb = HistoryCallback()
+        
+        trainer = pl.Trainer(
+            strategy='auto', 
+            accelerator='gpu', 
+            devices=[args.gpu], 
+            max_epochs=max_epochs, 
+            callbacks=[history_cb], 
+            enable_progress_bar=False, 
+            enable_checkpointing=False, 
+            precision='bf16-mixed', 
+            logger=False
+        )
+        
         trainer.fit(model, train_dataloaders=train_loader)
-        # Add this line after trainer.fit(model, ...)
-        torch.save(model.model.state_dict(), f"{Run}/{_test_idx[0]}_model.pth")
+        
+        # Save history for this fold
+        fold_histories.append(history_cb.history['loss'])
+        
+        # Optional: Save fold model
+        # torch.save(model.model.state_dict(), f"{Run}/{subject_id}_fold{fold_idx}.pth")
 
-        # Test data is used only once
+        # Inference
         pred, real = inference_on_loader(model.model, test_loader)
         Pred.append(pred)
         Real.append(real)
+        fold_idx += 1
+        
+    # --- Post-Training Analysis ---
     Pred, Real = np.concatenate(Pred), np.concatenate(Real)
+    
+    # 1. Calculate Final Metrics for this Subject
+    final_acc = accuracy_score(Real, Pred)
+    final_f1 = f1_score(Real, Pred, average='macro')
+    
+    print(f"\n>>> Subject {subject_id} Completed <<<")
+    print(f"    Accuracy: {green(f'{final_acc:.4f}')}")
+    print(f"    F1 Score: {green(f'{final_f1:.4f}')}")
+    
+    # 2. Save Results to CSV
     np.savetxt(logf, np.array([Pred, Real]).T, delimiter=',', fmt='%d')
+
+    # 3. Generate Learning Curve (Average across 5 folds)
+    if fold_histories:
+        min_len = min([len(h) for h in fold_histories])
+        avg_loss = np.mean([h[:min_len] for h in fold_histories], axis=0)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(avg_loss, label=f'Subject {subject_id} Avg Loss', color='blue')
+        plt.title(f'Learning Curve - Subject {subject_id} (5-Fold Avg)')
+        plt.xlabel('Epochs')
+        plt.ylabel('Training Loss')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+        
+        # Save plot to Results/FAST/sub_X_curve.png
+        plot_path = f"{os.path.dirname(logf)}/sub_{subject_id}_curve.png"
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"    Learning curve saved to: {plot_path}\n")
 
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
@@ -164,7 +255,7 @@ if __name__ == '__main__':
         seq_len=800,
         window_len=sfreq,
         slide_step=sfreq//2,
-        head='Conv4Layers',
+        head='EEGNet_Encoder',
         n_classes=5,
         num_layers=4,
         num_heads=8,
@@ -172,23 +263,40 @@ if __name__ == '__main__':
     )
     
     X, Y = load_standardized_h5('Processed/BCIC2020Track3.h5')
+    
     for fold in range(15):
         if fold not in args.folds:
             continue
         flog = f"{Run}/{fold}-Tune.csv"
-        if os.path.exists(flog):
-            print(f"Skip {flog}")
-            continue
-        Finetune(config, X[fold], Y[fold], flog, max_epochs=200)
+        
+        # NOTE: Pass 'fold' as subject_id to track plots
+        Finetune(config, X[fold], Y[fold], flog, subject_id=fold, max_epochs=200)
 
-    accuracy = []
+    # --- Global Summary ---
+    print("\n========================================")
+    print("      ALL SUBJECTS EVALUATION COMPLETE    ")
+    print("========================================")
+    
+    # Re-read all generated CSVs to calculate global stats
+    all_accuracies = []
+    all_f1s = []
+    
     for fold in range(15):
         flog = f"{Run}/{fold}-Tune.csv"
         if not os.path.exists(flog):
-            print(f"Skip {flog}")
             continue
+            
         data = np.loadtxt(flog, delimiter=',', dtype=int)
         pred, label = data[:, 0], data[:, 1]
-        accuracy.append(np.mean(pred == label))
+        
+        acc = accuracy_score(label, pred)
+        f1 = f1_score(label, pred, average='macro')
+        
+        all_accuracies.append(acc)
+        all_f1s.append(f1)
 
-    print(f"Accuracy: {np.mean(accuracy):3f}, Std: {np.std(accuracy):3f}")
+    if all_accuracies:
+        print(f"Overall Average Accuracy: {np.mean(all_accuracies):.4f} ± {np.std(all_accuracies):.4f}")
+        print(f"Overall Average F1 Score: {np.mean(all_f1s):.4f} ± {np.std(all_f1s):.4f}")
+    else:
+        print("No results found.")
