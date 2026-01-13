@@ -139,11 +139,18 @@ class EEG_Encoder_Module(pl.LightningModule):
         return loss
 
 def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pretrain=None):
+    """
+    Train per subject, saves ONLY best fold, and logs full metrics.
+    """
     seed_all(42)
     Pred, Real = [], []
     kf = KFold(n_splits=5, shuffle=False)
     
     fold_histories = []
+    
+    # NEW: Track performance of every fold
+    fold_metrics = [] # Stores [fold_idx, accuracy, f1]
+    best_fold_acc = -1.0
 
     fold_idx = 0
     for _train_idx, _test_idx in kf.split(Data_X):
@@ -178,30 +185,86 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         trainer.fit(model, train_dataloaders=train_loader)
         fold_histories.append(history_cb.history['loss'])
         
-        # torch.save(model.model.state_dict(), f"{Run}/{subject_id}_fold{fold_idx}.pth")
-
+        # --- Inference for this fold ---
         pred, real = inference_on_loader(model.model, test_loader)
+        
+        # Calculate specific metrics for this fold
+        fold_acc = accuracy_score(real, pred)
+        fold_f1 = f1_score(real, pred, average='macro')
+        fold_metrics.append([fold_idx, fold_acc, fold_f1])
+        
+        # --- Save ONLY Best Fold ---
+        if fold_acc > best_fold_acc:
+            best_fold_acc = fold_acc
+            save_path = f"{Run}/{subject_id}_best.pth"
+            torch.save(model.model.state_dict(), save_path)
+            print(f"    -> New Best Fold (Acc: {green(f'{fold_acc:.4f}')}). Model saved.")
+        else:
+            print(f"    -> Fold Acc: {fold_acc:.4f} (Did not beat {best_fold_acc:.4f})")
+
         Pred.append(pred)
         Real.append(real)
         fold_idx += 1
         
     Pred, Real = np.concatenate(Pred), np.concatenate(Real)
     
+    # Global Subject Metrics (Concatenated)
     final_acc = accuracy_score(Real, Pred)
     final_f1 = f1_score(Real, Pred, average='macro')
     
     print(f"\n>>> Subject {subject_id} Completed <<<")
-    print(f"    Accuracy: {green(f'{final_acc:.4f}')}")
-    print(f"    F1 Score: {green(f'{final_f1:.4f}')}")
+    print(f"    Aggregated Accuracy: {green(f'{final_acc:.4f}')}")
+    print(f"    Aggregated F1 Score: {green(f'{final_f1:.4f}')}")
     
+    # Save Predictions (Raw)
     np.savetxt(logf, np.array([Pred, Real]).T, delimiter=',', fmt='%d')
+    
+    # --- SAVE METRICS CSV (Detailed Fold Info) ---
+    metrics_arr = np.array(fold_metrics)
+    mean_fold_acc = np.mean(metrics_arr[:, 1])
+    std_fold_acc = np.std(metrics_arr[:, 1])
+    mean_fold_f1 = np.mean(metrics_arr[:, 2])
+    std_fold_f1 = np.std(metrics_arr[:, 2])
+    
+    metrics_file = f"{Run}/sub-{subject_id}_metrics.csv"
+    
+    # Format: Fold, Acc, F1 (Rows 1-5), then Summary Statistics
+    with open(metrics_file, 'w') as f:
+        f.write("Fold,Accuracy,F1_Score\n")
+        for row in metrics_arr:
+            f.write(f"{int(row[0])},{row[1]:.5f},{row[2]:.5f}\n")
+        f.write(f"\nMEAN,{mean_fold_acc:.5f},{mean_fold_f1:.5f}\n")
+        f.write(f"STD,{std_fold_acc:.5f},{std_fold_f1:.5f}\n")
+    print(f"    Metrics CSV saved to: {metrics_file}")
 
+    # --- SAVE VISUALIZATIONS ---
+    
+    # 1. Fold Performance Bar Chart
+    plt.figure(figsize=(8, 5))
+    folds = [int(x[0])+1 for x in fold_metrics]
+    accs = [x[1] for x in fold_metrics]
+    
+    plt.bar(folds, accs, color='teal', alpha=0.7, edgecolor='black')
+    plt.axhline(y=mean_fold_acc, color='red', linestyle='--', label=f'Mean: {mean_fold_acc:.2f}')
+    
+    plt.ylim(0, 1.0)
+    plt.title(f'Subject {subject_id}: 5-Fold Stability')
+    plt.xlabel('Fold Index')
+    plt.ylabel('Test Accuracy')
+    plt.legend()
+    plt.grid(axis='y', alpha=0.3)
+    
+    fold_plot_path = f"{Run}/sub-{subject_id}_folds.png"
+    plt.savefig(fold_plot_path)
+    plt.close()
+    
+    # 2. Learning Curve (Average)
     if fold_histories:
         min_len = min([len(h) for h in fold_histories])
         avg_loss = np.mean([h[:min_len] for h in fold_histories], axis=0)
         
         plt.figure(figsize=(10, 6))
-        plt.plot(avg_loss, label=f'Sub {subject_id} Avg Loss', color='blue')
+        plt.plot(avg_loss, label=f'Avg Loss', color='blue')
         
         min_loss_val = np.min(avg_loss)
         min_loss_idx = np.argmin(avg_loss)
@@ -212,21 +275,16 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
                      xytext=(min_loss_idx, min_loss_val + 0.2),
                      arrowprops=dict(facecolor='green', shrink=0.05))
         
-        plt.annotate(f'Final: {final_loss_val:.4f}', 
-                     xy=(len(avg_loss)-1, final_loss_val), 
-                     xytext=(len(avg_loss)-20, final_loss_val + 0.2),
-                     arrowprops=dict(facecolor='red', shrink=0.05))
-
         plt.title(f'Learning Curve - Subject {subject_id} (5-Fold Avg)')
         plt.xlabel('Epochs')
         plt.ylabel('Training Loss')
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.legend()
         
-        plot_path = f"{os.path.dirname(logf)}/sub_{subject_id}_curve.png"
-        plt.savefig(plot_path)
+        curve_path = f"{Run}/sub-{subject_id}_curve.png"
+        plt.savefig(curve_path)
         plt.close()
-        print(f"    Learning curve saved to: {plot_path}\n")
+        print(f"    Visualizations saved.")
 
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
@@ -263,8 +321,6 @@ if __name__ == '__main__':
     
     global_acc = []
     global_f1 = []
-    
-    # Keep track of which subject ID corresponds to which accuracy
     subject_ids = []
 
     for fold in range(15):
@@ -301,21 +357,18 @@ if __name__ == '__main__':
         print(f"Final Average Accuracy: {avg_acc:.4f} ± {std_acc:.4f}")
         print(f"Final Average F1 Score: {np.mean(global_f1):.4f} ± {np.std(global_f1):.4f}")
         
-        # --- NEW: Breakdown Plot ---
         plt.figure(figsize=(12, 6))
         
+        # 
         # Bar chart for individual subjects
         bars = plt.bar(subject_ids, global_acc, color='skyblue', edgecolor='black', alpha=0.7, label='Subject Accuracy')
         
-        # Horizontal line for global average
         plt.axhline(y=avg_acc, color='red', linestyle='--', linewidth=2, label=f'Mean ({avg_acc:.2f})')
         
-        # Shaded area for Std Dev
         plt.fill_between([min(subject_ids)-0.5, max(subject_ids)+0.5], 
                          avg_acc - std_acc, avg_acc + std_acc, 
                          color='red', alpha=0.1, label='Std Dev')
 
-        # Add labels on top of bars
         for bar in bars:
             height = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2., height,
