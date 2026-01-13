@@ -11,6 +11,7 @@ import argparse
 import random
 import time
 import numpy as np
+import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 torch.set_num_threads(8)
@@ -21,7 +22,7 @@ import torchmetrics
 import logging
 import h5py
 import einops
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 from transformers import PretrainedConfig
 import lightning as pl
@@ -35,18 +36,23 @@ from BCIC2020Track3_preprocess import Electrodes, Zones
 
 # --- 1. Custom Callback for Learning Curve ---
 class HistoryCallback(Callback):
-    """Captures loss and metrics at the end of every epoch."""
+    """Captures train/val loss and metrics at the end of every epoch."""
     def __init__(self):
-        self.history = {'loss': [], 'acc': []}
+        self.history = {'loss': [], 'acc': [], 'val_loss': [], 'val_acc': []}
 
     def on_train_epoch_end(self, trainer, pl_module):
+        # Training Metrics
         loss = trainer.callback_metrics.get('train_loss')
         acc = trainer.callback_metrics.get('train_acc')
+        if loss is not None: self.history['loss'].append(loss.item())
+        if acc is not None: self.history['acc'].append(acc.item())
         
-        if loss is not None:
-            self.history['loss'].append(loss.item())
-        if acc is not None:
-            self.history['acc'].append(acc.item())
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Validation Metrics
+        val_loss = trainer.callback_metrics.get('val_loss')
+        val_acc = trainer.callback_metrics.get('val_acc')
+        if val_loss is not None: self.history['val_loss'].append(val_loss.item())
+        if val_acc is not None: self.history['val_acc'].append(val_acc.item())
 
 def seed_all(seed):
     random.seed(seed)
@@ -116,8 +122,13 @@ class EEG_Encoder_Module(pl.LightningModule):
         self.loss = nn.CrossEntropyLoss()
         self.cosine_lr_list = cosine_scheduler(1, 0.1, max_epochs, niter_per_ep, warmup_epochs=10)
         
+        # Training Metrics
         self.train_acc = torchmetrics.Accuracy('multiclass', num_classes=config.n_classes)
         self.train_f1  = torchmetrics.F1Score('multiclass', num_classes=config.n_classes, average='macro')
+        
+        # Validation Metrics
+        self.val_acc = torchmetrics.Accuracy('multiclass', num_classes=config.n_classes)
+        self.val_f1 = torchmetrics.F1Score('multiclass', num_classes=config.n_classes, average='macro')
 
     def configure_optimizers(self):
         self.optimizer = optim.AdamW(self.parameters(), lr=0.0005)
@@ -135,38 +146,146 @@ class EEG_Encoder_Module(pl.LightningModule):
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train_acc', acc, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train_f1', f1, on_step=False, on_epoch=True, prog_bar=True)
-        
         return loss
 
-def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pretrain=None):
-    """
-    Train per subject, saves ONLY best fold, and logs full metrics.
-    """
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self.model(x)
+        loss = self.loss(logits, y)
+        
+        acc = self.val_acc(logits, y)
+        f1 = self.val_f1(logits, y)
+        
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_acc', acc, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+# --- MODIFIED: LOSO Pretraining with Validation Split ---
+def Pretrain_LOSO(config, All_X, All_Y, target_subject_idx, save_dir, max_epochs=100, num_workers=4):
+    ckpt_path = f"{save_dir}/Pretrain_excludes_sub{target_subject_idx}.pth"
+    csv_log_path = f"{save_dir}/Pretrain_excludes_sub{target_subject_idx}_metrics.csv"
+    plot_path = f"{save_dir}/Pretrain_excludes_sub{target_subject_idx}_curve.png"
+    
+    if os.path.exists(ckpt_path):
+        print(f"Found existing pretraining for Subject {target_subject_idx}: {yellow(ckpt_path)}")
+        return ckpt_path
+    
+    print(f"\n>>> Starting LOSO Pretraining (Excluding Subject {target_subject_idx}) <<<")
+    
+    # 1. Gather Data (All subjects except target)
+    X_train_pool = []
+    Y_train_pool = []
+    
+    for s in range(len(All_X)):
+        if s != target_subject_idx:
+            X_train_pool.append(All_X[s])
+            Y_train_pool.append(All_Y[s])
+            
+    X_train_pool = np.concatenate(X_train_pool, axis=0)
+    Y_train_pool = np.concatenate(Y_train_pool, axis=0)
+    
+    # 2. CREATE VALIDATION SPLIT (90% Train, 10% Val)
+    X_train, X_val, Y_train, Y_val = train_test_split(
+        X_train_pool, Y_train_pool, test_size=0.10, random_state=42, stratify=Y_train_pool
+    )
+    
+    print(f"    Pooled Train: {X_train.shape} | Val: {X_val.shape}")
+    
+    train_data = BasicDataset(X_train, Y_train)
+    val_data = BasicDataset(X_val, Y_val)
+    
+    train_loader = DataLoader(train_data, batch_size=64, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_data, batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=True)
+    
+    model = EEG_Encoder_Module(config, max_epochs, len(train_loader))
+    history_cb = HistoryCallback()
+    
+    trainer = pl.Trainer(
+        strategy='auto', 
+        accelerator='gpu', 
+        devices=[args.gpu], 
+        max_epochs=max_epochs,
+        callbacks=[history_cb],
+        enable_progress_bar=True,
+        enable_checkpointing=False, 
+        precision='bf16-mixed', 
+        logger=False
+    )
+    
+    # Pass both train and val loaders
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    
+    # 3. Save Metrics & Plot with Validation Curves
+    df_metrics = pd.DataFrame(history_cb.history)
+    df_metrics.to_csv(csv_log_path, index_label='Epoch')
+    
+    plt.figure(figsize=(12, 5))
+    
+    # Subplot 1: Loss
+    plt.subplot(1, 2, 1)
+    plt.plot(df_metrics['loss'], label='Train Loss', color='blue')
+    plt.plot(df_metrics['val_loss'], label='Val Loss', color='orange', linestyle='--')
+    plt.title(f'LOSO Pretraining Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 2: Accuracy
+    plt.subplot(1, 2, 2)
+    plt.plot(df_metrics['acc'], label='Train Acc', color='green')
+    plt.plot(df_metrics['val_acc'], label='Val Acc', color='red', linestyle='--')
+    plt.title(f'LOSO Pretraining Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(plot_path)
+    plt.close()
+    
+    torch.save(model.model.state_dict(), ckpt_path)
+    print(f"    LOSO Pretraining Saved: {green(ckpt_path)}")
+    return ckpt_path
+
+# --- MODIFIED: Finetune with Validation Split ---
+def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pretrain=None, num_workers=4):
     seed_all(42)
     Pred, Real = [], []
     kf = KFold(n_splits=5, shuffle=False)
     
     fold_histories = []
-    
-    # NEW: Track performance of every fold
-    fold_metrics = [] # Stores [fold_idx, accuracy, f1]
+    fold_metrics = [] 
     best_fold_acc = -1.0
 
     fold_idx = 0
     for _train_idx, _test_idx in kf.split(Data_X):
-        x_train, y_train = Data_X[_train_idx], Data_Y[_train_idx]
+        # 1. Standard CV Split (Train+Val vs Test)
+        x_train_full, y_train_full = Data_X[_train_idx], Data_Y[_train_idx]
         x_test, y_test = Data_X[_test_idx], Data_Y[_test_idx]
 
+        # 2. INTERNAL VALIDATION SPLIT (90% Train, 10% Val)
+        # We split the training data again to monitor overfitting during fine-tuning
+        x_train, x_val, y_train, y_val = train_test_split(
+            x_train_full, y_train_full, test_size=0.10, random_state=42, stratify=y_train_full
+        )
+
         train_data = BasicDataset(x_train, y_train)
-        train_loader = DataLoader(train_data, batch_size=len(x_train), shuffle=True, num_workers=4, pin_memory=True)
+        val_data = BasicDataset(x_val, y_val)
         test_data = BasicDataset(x_test, y_test)
-        test_loader = DataLoader(test_data, batch_size=len(x_test), shuffle=False, num_workers=4, pin_memory=True)
+
+        train_loader = DataLoader(train_data, batch_size=len(x_train), shuffle=True, num_workers=num_workers, pin_memory=True)
+        val_loader = DataLoader(val_data, batch_size=len(x_val), shuffle=False, num_workers=num_workers, pin_memory=True)
+        test_loader = DataLoader(test_data, batch_size=len(x_test), shuffle=False, num_workers=num_workers, pin_memory=True)
 
         model = EEG_Encoder_Module(config, max_epochs, len(train_loader))
+        
         if ckpt_pretrain is not None:
+            print(f"Fold {fold_idx}: Loading LOSO weights...")
             model.model.load_state_dict(torch.load(ckpt_pretrain, weights_only=True))
 
-        print(f"Fold {fold_idx+1}/5 | {yellow(logf)} | Train: {x_train.shape} | Test: {x_test.shape}")
+        print(f"Fold {fold_idx+1}/5 | Train: {x_train.shape} | Val: {x_val.shape} | Test: {x_test.shape}")
         
         history_cb = HistoryCallback()
         
@@ -182,25 +301,24 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
             logger=False
         )
         
-        trainer.fit(model, train_dataloaders=train_loader)
-        fold_histories.append(history_cb.history['loss'])
+        # Train with validation
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
         
-        # --- Inference for this fold ---
+        # Store full history for this fold
+        fold_histories.append(history_cb.history)
+        
+        # --- Inference on Test Set ---
         pred, real = inference_on_loader(model.model, test_loader)
         
-        # Calculate specific metrics for this fold
         fold_acc = accuracy_score(real, pred)
         fold_f1 = f1_score(real, pred, average='macro')
         fold_metrics.append([fold_idx, fold_acc, fold_f1])
         
-        # --- Save ONLY Best Fold ---
         if fold_acc > best_fold_acc:
             best_fold_acc = fold_acc
             save_path = f"{Run}/{subject_id}_best.pth"
             torch.save(model.model.state_dict(), save_path)
             print(f"    -> New Best Fold (Acc: {green(f'{fold_acc:.4f}')}). Model saved.")
-        else:
-            print(f"    -> Fold Acc: {fold_acc:.4f} (Did not beat {best_fold_acc:.4f})")
 
         Pred.append(pred)
         Real.append(real)
@@ -208,89 +326,87 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         
     Pred, Real = np.concatenate(Pred), np.concatenate(Real)
     
-    # Global Subject Metrics (Concatenated)
+    # Global Metrics
     final_acc = accuracy_score(Real, Pred)
     final_f1 = f1_score(Real, Pred, average='macro')
     
     print(f"\n>>> Subject {subject_id} Completed <<<")
     print(f"    Aggregated Accuracy: {green(f'{final_acc:.4f}')}")
-    print(f"    Aggregated F1 Score: {green(f'{final_f1:.4f}')}")
     
-    # Save Predictions (Raw)
     np.savetxt(logf, np.array([Pred, Real]).T, delimiter=',', fmt='%d')
     
-    # --- SAVE METRICS CSV (Detailed Fold Info) ---
+    # Save Metrics CSV
     metrics_arr = np.array(fold_metrics)
-    mean_fold_acc = np.mean(metrics_arr[:, 1])
-    std_fold_acc = np.std(metrics_arr[:, 1])
-    mean_fold_f1 = np.mean(metrics_arr[:, 2])
-    std_fold_f1 = np.std(metrics_arr[:, 2])
-    
     metrics_file = f"{Run}/sub-{subject_id}_metrics.csv"
-    
-    # Format: Fold, Acc, F1 (Rows 1-5), then Summary Statistics
     with open(metrics_file, 'w') as f:
         f.write("Fold,Accuracy,F1_Score\n")
         for row in metrics_arr:
             f.write(f"{int(row[0])},{row[1]:.5f},{row[2]:.5f}\n")
-        f.write(f"\nMEAN,{mean_fold_acc:.5f},{mean_fold_f1:.5f}\n")
-        f.write(f"STD,{std_fold_acc:.5f},{std_fold_f1:.5f}\n")
-    print(f"    Metrics CSV saved to: {metrics_file}")
-
-    # --- SAVE VISUALIZATIONS ---
+        f.write(f"\nMEAN,{np.mean(metrics_arr[:, 1]):.5f},{np.mean(metrics_arr[:, 2]):.5f}\n")
     
-    # 1. Fold Performance Bar Chart
-    plt.figure(figsize=(8, 5))
-    folds = [int(x[0])+1 for x in fold_metrics]
-    accs = [x[1] for x in fold_metrics]
-    
-    plt.bar(folds, accs, color='teal', alpha=0.7, edgecolor='black')
-    plt.axhline(y=mean_fold_acc, color='red', linestyle='--', label=f'Mean: {mean_fold_acc:.2f}')
-    
-    plt.ylim(0, 1.0)
-    plt.title(f'Subject {subject_id}: 5-Fold Stability')
-    plt.xlabel('Fold Index')
-    plt.ylabel('Test Accuracy')
-    plt.legend()
-    plt.grid(axis='y', alpha=0.3)
-    
-    fold_plot_path = f"{Run}/sub-{subject_id}_folds.png"
-    plt.savefig(fold_plot_path)
-    plt.close()
-    
-    # 2. Learning Curve (Average)
+    # --- VISUALIZATION: Average Learning Curves with Validation ---
     if fold_histories:
-        min_len = min([len(h) for h in fold_histories])
-        avg_loss = np.mean([h[:min_len] for h in fold_histories], axis=0)
+        # We need to average lists that might be slightly different lengths (though here fixed epochs)
+        # Helper to safely get mean across folds
+        def get_avg_metric(key):
+            vals = [h[key] for h in fold_histories if key in h]
+            if not vals: return []
+            min_len = min(len(v) for v in vals)
+            return np.mean([v[:min_len] for v in vals], axis=0)
+
+        avg_train_loss = get_avg_metric('loss')
+        avg_val_loss = get_avg_metric('val_loss')
+        avg_train_acc = get_avg_metric('acc')
+        avg_val_acc = get_avg_metric('val_acc')
         
-        plt.figure(figsize=(10, 6))
-        plt.plot(avg_loss, label=f'Avg Loss', color='blue')
+        plt.figure(figsize=(12, 6))
         
-        min_loss_val = np.min(avg_loss)
-        min_loss_idx = np.argmin(avg_loss)
-        final_loss_val = avg_loss[-1]
-        
-        plt.annotate(f'Min: {min_loss_val:.4f}', 
-                     xy=(min_loss_idx, min_loss_val), 
-                     xytext=(min_loss_idx, min_loss_val + 0.2),
-                     arrowprops=dict(facecolor='green', shrink=0.05))
-        
-        plt.title(f'Learning Curve - Subject {subject_id} (5-Fold Avg)')
-        plt.xlabel('Epochs')
-        plt.ylabel('Training Loss')
-        plt.grid(True, linestyle='--', alpha=0.7)
+        # Subplot 1: Loss
+        plt.subplot(1, 2, 1)
+        if len(avg_train_loss) > 0: plt.plot(avg_train_loss, label='Avg Train Loss', color='blue')
+        if len(avg_val_loss) > 0: plt.plot(avg_val_loss, label='Avg Val Loss', color='orange', linestyle='--')
+        plt.title(f'Subject {subject_id} Fine-tuning Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
         plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Subplot 2: Accuracy
+        plt.subplot(1, 2, 2)
+        if len(avg_train_acc) > 0: plt.plot(avg_train_acc, label='Avg Train Acc', color='green')
+        if len(avg_val_acc) > 0: plt.plot(avg_val_acc, label='Avg Val Acc', color='red', linestyle='--')
+        plt.title(f'Subject {subject_id} Fine-tuning Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
         
         curve_path = f"{Run}/sub-{subject_id}_curve.png"
         plt.savefig(curve_path)
         plt.close()
-        print(f"    Visualizations saved.")
+        
+    # Save Bar Chart
+    plt.figure(figsize=(6, 4))
+    folds_idx = [int(x[0])+1 for x in fold_metrics]
+    accs = [x[1] for x in fold_metrics]
+    plt.bar(folds_idx, accs, color='teal', alpha=0.7, edgecolor='black')
+    plt.axhline(y=np.mean(accs), color='red', linestyle='--', label=f'Mean: {np.mean(accs):.2f}')
+    plt.title(f'Subject {subject_id}: 5-Fold Stability')
+    plt.ylabel('Test Accuracy')
+    plt.savefig(f"{Run}/sub-{subject_id}_folds.png")
+    plt.close()
 
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
     args.add_argument('--gpu', type=int, default=0)
     args.add_argument('--folds', type=str, default='0-15')
+    args.add_argument('--workers', type=int, default=4, help='Dataloader workers. -1 for auto.')
     args = args.parse_args()
+
+    # Auto-detect workers
+    if args.workers == -1:
+        args.workers = min(8, os.cpu_count() or 1)
+        print(f"Auto-detected workers: {args.workers}")
 
     if '-' in args.folds:
         start, end = [int(x) for x in args.folds.split('-')]
@@ -320,72 +436,41 @@ if __name__ == '__main__':
     X, Y = load_standardized_h5('Processed/BCIC2020Track3.h5')
     
     global_acc = []
-    global_f1 = []
     subject_ids = []
 
     for fold in range(15):
         if fold not in args.folds:
             continue
+        
         flog = f"{Run}/{fold}-Tune.csv"
         
-        Finetune(config, X[fold], Y[fold], flog, subject_id=fold, max_epochs=200)
+        # 1. Pretrain (LOSO)
+        pretrained_path = Pretrain_LOSO(
+            config, X, Y, target_subject_idx=fold, save_dir=Run, 
+            max_epochs=50, num_workers=args.workers
+        )
+        
+        # 2. Finetune (LOFO)
+        Finetune(
+            config, X[fold], Y[fold], flog, subject_id=fold, 
+            max_epochs=200, ckpt_pretrain=pretrained_path, num_workers=args.workers
+        )
 
+        # Global stats logic...
         data = np.loadtxt(flog, delimiter=',', dtype=int)
-        pred, label = data[:, 0], data[:, 1]
-        
-        acc = accuracy_score(label, pred)
-        f1 = f1_score(label, pred, average='macro')
-        
+        acc = accuracy_score(data[:, 1], data[:, 0])
         global_acc.append(acc)
-        global_f1.append(f1)
         subject_ids.append(fold)
-        
-        mean_acc = np.mean(global_acc)
-        mean_f1 = np.mean(global_f1)
-        print(f"    [Rolling Average (N={len(global_acc)})] Acc: {green(f'{mean_acc:.4f}')} | F1: {green(f'{mean_f1:.4f}')}")
+        print(f"    Rolling Avg Acc: {green(f'{np.mean(global_acc):.4f}')}")
         print("    --------------------------------------------------")
 
-    # --- Final Summary & Visualization ---
-    print("\n========================================")
-    print("      ALL SUBJECTS EVALUATION COMPLETE    ")
-    print("========================================")
-    
+    # Final Summary Plot
     if global_acc:
-        avg_acc = np.mean(global_acc)
-        std_acc = np.std(global_acc)
-        
-        print(f"Final Average Accuracy: {avg_acc:.4f} ± {std_acc:.4f}")
-        print(f"Final Average F1 Score: {np.mean(global_f1):.4f} ± {np.std(global_f1):.4f}")
-        
+        avg = np.mean(global_acc)
+        print(f"Final Average Accuracy: {avg:.4f}")
         plt.figure(figsize=(12, 6))
-        
-        # 
-        # Bar chart for individual subjects
-        bars = plt.bar(subject_ids, global_acc, color='skyblue', edgecolor='black', alpha=0.7, label='Subject Accuracy')
-        
-        plt.axhline(y=avg_acc, color='red', linestyle='--', linewidth=2, label=f'Mean ({avg_acc:.2f})')
-        
-        plt.fill_between([min(subject_ids)-0.5, max(subject_ids)+0.5], 
-                         avg_acc - std_acc, avg_acc + std_acc, 
-                         color='red', alpha=0.1, label='Std Dev')
-
-        for bar in bars:
-            height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., height,
-                     f'{height:.2f}',
-                     ha='center', va='bottom', fontsize=9)
-
-        plt.xticks(subject_ids)
-        plt.xlabel('Subject ID')
-        plt.ylabel('Accuracy')
+        plt.bar(subject_ids, global_acc, color='skyblue', edgecolor='black')
+        plt.axhline(y=avg, color='red', linestyle='--')
         plt.title('Accuracy Contribution Breakdown per Subject')
-        plt.legend(loc='lower right')
-        plt.grid(axis='y', linestyle='--', alpha=0.5)
-        
-        final_plot_path = f"{Run}/Global_Accuracy_Breakdown.png"
-        plt.savefig(final_plot_path)
+        plt.savefig(f"{Run}/Global_Accuracy_Breakdown.png")
         plt.close()
-        print(f"\n[Visual] Breakdown plot saved to: {final_plot_path}")
-        
-    else:
-        print("No results found.")
