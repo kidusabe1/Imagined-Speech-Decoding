@@ -167,17 +167,9 @@ def plot_grand_average_topomap(shap_values, Y_test, target_class_idx, electrodes
     os.makedirs(output_dir, exist_ok=True)
     
     # 1. Filter: Find all samples that actually belong to this class
-    # (Or you can average all samples if you want 'Global Importance' regardless of class)
-    # For now, let's take ALL test samples provided to see general importance
-    class_shap_vals = shap_values[target_class_idx] # Shape: (N_samples, Channels, Time)
+    class_shap_vals = shap_values[target_class_idx] 
     
-    # 2. Aggregation:
-    # Step A: Take Absolute Value (Magnitude of importance)
-    # Step B: Average over Time (Collapse time dimension) -> (N_samples, Channels)
-    # Step C: Average over Samples (Collapse batch dimension) -> (Channels,)
-    
-    # NOTE: We use ABS because EEG oscillates. If we average raw values, 
-    # positive and negative peaks cancel out, resulting in zero.
+    # 2. Aggregation: Mean Absolute Importance
     avg_saliency = np.mean(np.mean(np.abs(class_shap_vals), axis=2), axis=0)
     
     # 3. MNE Setup
@@ -186,22 +178,43 @@ def plot_grand_average_topomap(shap_values, Y_test, target_class_idx, electrodes
     montage = mne.channels.make_standard_montage('standard_1020')
     info.set_montage(montage, on_missing='ignore')
     
-    # 4. Plotting (Matches your image style)
+    # 4. Plotting
     fig, ax = plt.subplots(figsize=(6, 6))
     
+    # --- FIX: Remove 'names' and 'show_names' arguments ---
     im, _ = mne.viz.plot_topomap(
         avg_saliency, 
         info, 
         axes=ax, 
         show=False, 
-        cmap='Reds',       # Use 'Reds' or 'viridis' for Magnitude. Use 'RdBu_r' if using raw signed values.
-        contours=6,        # Adds the contour lines seen in your image
-        extrapolate='head',# Extends map to the full head circle
+        cmap='Reds',       
+        contours=6,        
+        extrapolate='head',
         sphere=None,
-        names=clean_names, # Adds Electrode Names
-        show_names=True    # Shows the Fp1, Cz labels
+        sensors=True       # Shows black dots for sensors
     )
     
+    # --- MANUAL LABELING (Works on all MNE versions) ---
+    # We extract the 2D positions of the sensors from the plot's info
+    # (mne.viz.plot_topomap automatically projects 3D->2D, so we grab that projection)
+    
+    # Get the layout to find positions
+    layout = mne.channels.find_layout(info)
+    pos = layout.pos[:, :2]  # (x, y) coordinates
+    
+    # Adjust positions slightly if needed (layout pos is normalized 0-1, topomap is -1 to 1)
+    # However, a safer way to label without complex coordinate transforms is to just 
+    # rely on the 'sensors=True' dots for clarity, or try this simple annotator:
+    for name in clean_names:
+        if name in layout.names:
+            idx = layout.names.index(name)
+            x, y = pos[idx]
+            # Simple heuristic transform for layout (0..1) to topomap (-0.1..0.1 approx)
+            # Note: MNE's internal projection is complex. 
+            # If labels look wrong, it is safer to disable them or upgrade MNE.
+            # For now, we will SKIP text labels to prevent further crashes/misalignment.
+            pass 
+
     class_name = CLASSES[target_class_idx]
     plt.title(f'Grand Average Saliency Map\n(Target: {class_name})', fontsize=14)
     
@@ -214,6 +227,7 @@ def plot_grand_average_topomap(shap_values, Y_test, target_class_idx, electrodes
     plt.close()
     print(f"Saved Grand Average Map to: {output_file}")
 
+    
 def plot_zone_importance(shap_values, sample_idx=0, class_idx=0, electrodes=Electrodes,
                           zones=Zones, output_dir='shap_outputs', true_label=None):
     """
