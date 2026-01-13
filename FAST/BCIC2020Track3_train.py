@@ -160,7 +160,7 @@ class EEG_Encoder_Module(pl.LightningModule):
         self.log('val_acc', acc, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
-# --- MODIFIED: LOSO Pretraining with Validation Split ---
+# --- FIXED: LOSO Pretraining (Added num_sanity_val_steps=0) ---
 def Pretrain_LOSO(config, All_X, All_Y, target_subject_idx, save_dir, max_epochs=100, num_workers=4):
     ckpt_path = f"{save_dir}/Pretrain_excludes_sub{target_subject_idx}.pth"
     csv_log_path = f"{save_dir}/Pretrain_excludes_sub{target_subject_idx}_metrics.csv"
@@ -209,22 +209,27 @@ def Pretrain_LOSO(config, All_X, All_Y, target_subject_idx, save_dir, max_epochs
         enable_progress_bar=True,
         enable_checkpointing=False, 
         precision='bf16-mixed', 
-        logger=False
+        logger=False,
+        num_sanity_val_steps=0  # <--- FIX: Prevents metric mismatch
     )
     
     # Pass both train and val loaders
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
     
-    # 3. Save Metrics & Plot with Validation Curves
-    df_metrics = pd.DataFrame(history_cb.history)
+    # 3. Save Metrics (With Safety Trimming)
+    # This block ensures all lists are the same length before making the DataFrame
+    min_len = min(len(v) for v in history_cb.history.values())
+    clean_history = {k: v[:min_len] for k, v in history_cb.history.items()}
+    
+    df_metrics = pd.DataFrame(clean_history)
     df_metrics.to_csv(csv_log_path, index_label='Epoch')
     
     plt.figure(figsize=(12, 5))
     
     # Subplot 1: Loss
     plt.subplot(1, 2, 1)
-    plt.plot(df_metrics['loss'], label='Train Loss', color='blue')
-    plt.plot(df_metrics['val_loss'], label='Val Loss', color='orange', linestyle='--')
+    if 'loss' in df_metrics: plt.plot(df_metrics['loss'], label='Train Loss', color='blue')
+    if 'val_loss' in df_metrics: plt.plot(df_metrics['val_loss'], label='Val Loss', color='orange', linestyle='--')
     plt.title(f'LOSO Pretraining Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
@@ -233,8 +238,8 @@ def Pretrain_LOSO(config, All_X, All_Y, target_subject_idx, save_dir, max_epochs
     
     # Subplot 2: Accuracy
     plt.subplot(1, 2, 2)
-    plt.plot(df_metrics['acc'], label='Train Acc', color='green')
-    plt.plot(df_metrics['val_acc'], label='Val Acc', color='red', linestyle='--')
+    if 'acc' in df_metrics: plt.plot(df_metrics['acc'], label='Train Acc', color='green')
+    if 'val_acc' in df_metrics: plt.plot(df_metrics['val_acc'], label='Val Acc', color='red', linestyle='--')
     plt.title(f'LOSO Pretraining Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
@@ -249,7 +254,7 @@ def Pretrain_LOSO(config, All_X, All_Y, target_subject_idx, save_dir, max_epochs
     print(f"    LOSO Pretraining Saved: {green(ckpt_path)}")
     return ckpt_path
 
-# --- MODIFIED: Finetune with Validation Split ---
+# --- FIXED: Finetune (Added num_sanity_val_steps=0) ---
 def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pretrain=None, num_workers=4):
     seed_all(42)
     Pred, Real = [], []
@@ -266,7 +271,6 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         x_test, y_test = Data_X[_test_idx], Data_Y[_test_idx]
 
         # 2. INTERNAL VALIDATION SPLIT (90% Train, 10% Val)
-        # We split the training data again to monitor overfitting during fine-tuning
         x_train, x_val, y_train, y_val = train_test_split(
             x_train_full, y_train_full, test_size=0.10, random_state=42, stratify=y_train_full
         )
@@ -275,9 +279,10 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         val_data = BasicDataset(x_val, y_val)
         test_data = BasicDataset(x_test, y_test)
 
-        train_loader = DataLoader(train_data, batch_size=len(x_train), shuffle=True, num_workers=num_workers, pin_memory=True)
-        val_loader = DataLoader(val_data, batch_size=len(x_val), shuffle=False, num_workers=num_workers, pin_memory=True)
-        test_loader = DataLoader(test_data, batch_size=len(x_test), shuffle=False, num_workers=num_workers, pin_memory=True)
+        # Optimize workers: 0 for small finetuning sets
+        train_loader = DataLoader(train_data, batch_size=len(x_train), shuffle=True, num_workers=0, pin_memory=True)
+        val_loader = DataLoader(val_data, batch_size=len(x_val), shuffle=False, num_workers=0, pin_memory=True)
+        test_loader = DataLoader(test_data, batch_size=len(x_test), shuffle=False, num_workers=0, pin_memory=True)
 
         model = EEG_Encoder_Module(config, max_epochs, len(train_loader))
         
@@ -298,14 +303,17 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
             enable_progress_bar=False, 
             enable_checkpointing=False, 
             precision='bf16-mixed', 
-            logger=False
+            logger=False,
+            num_sanity_val_steps=0 # <--- FIX: Prevents metric mismatch
         )
         
         # Train with validation
         trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
         
-        # Store full history for this fold
-        fold_histories.append(history_cb.history)
+        # Safe Append with Trimming
+        min_len = min(len(v) for v in history_cb.history.values())
+        clean_history = {k: v[:min_len] for k, v in history_cb.history.items()}
+        fold_histories.append(clean_history)
         
         # --- Inference on Test Set ---
         pred, real = inference_on_loader(model.model, test_loader)
@@ -346,9 +354,8 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
     
     # --- VISUALIZATION: Average Learning Curves with Validation ---
     if fold_histories:
-        # We need to average lists that might be slightly different lengths (though here fixed epochs)
-        # Helper to safely get mean across folds
         def get_avg_metric(key):
+            # Only average if key exists in all folds
             vals = [h[key] for h in fold_histories if key in h]
             if not vals: return []
             min_len = min(len(v) for v in vals)
@@ -361,7 +368,6 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         
         plt.figure(figsize=(12, 6))
         
-        # Subplot 1: Loss
         plt.subplot(1, 2, 1)
         if len(avg_train_loss) > 0: plt.plot(avg_train_loss, label='Avg Train Loss', color='blue')
         if len(avg_val_loss) > 0: plt.plot(avg_val_loss, label='Avg Val Loss', color='orange', linestyle='--')
@@ -371,7 +377,6 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         plt.legend()
         plt.grid(True, alpha=0.3)
         
-        # Subplot 2: Accuracy
         plt.subplot(1, 2, 2)
         if len(avg_train_acc) > 0: plt.plot(avg_train_acc, label='Avg Train Acc', color='green')
         if len(avg_val_acc) > 0: plt.plot(avg_val_acc, label='Avg Val Acc', color='red', linestyle='--')
@@ -385,7 +390,6 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         plt.savefig(curve_path)
         plt.close()
         
-    # Save Bar Chart
     plt.figure(figsize=(6, 4))
     folds_idx = [int(x[0])+1 for x in fold_metrics]
     accs = [x[1] for x in fold_metrics]
@@ -453,7 +457,7 @@ if __name__ == '__main__':
         # 2. Finetune (LOFO)
         Finetune(
             config, X[fold], Y[fold], flog, subject_id=fold, 
-            max_epochs=200, ckpt_pretrain=pretrained_path, num_workers=args.workers
+            max_epochs=200, ckpt_pretrain=pretrained_path, num_workers=0
         )
 
         # Global stats logic...
