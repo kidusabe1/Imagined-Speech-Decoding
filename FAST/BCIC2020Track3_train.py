@@ -12,7 +12,7 @@ import random
 import time
 import numpy as np
 import torch
-import matplotlib.pyplot as plt  # Added for plotting
+import matplotlib.pyplot as plt
 torch.set_num_threads(8)
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -22,10 +22,10 @@ import logging
 import h5py
 import einops
 from sklearn.model_selection import KFold
-from sklearn.metrics import accuracy_score, f1_score # Added for explicit metric calculation
+from sklearn.metrics import accuracy_score, f1_score
 from transformers import PretrainedConfig
 import lightning as pl
-from lightning.pytorch.callbacks import Callback # Added for history tracking
+from lightning.pytorch.callbacks import Callback
 logging.getLogger('pytorch_lightning').setLevel(logging.WARNING)
 logging.getLogger('lightning').setLevel(logging.WARNING)
 
@@ -40,7 +40,6 @@ class HistoryCallback(Callback):
         self.history = {'loss': [], 'acc': []}
 
     def on_train_epoch_end(self, trainer, pl_module):
-        # Retrieve metrics logged in training_step
         loss = trainer.callback_metrics.get('train_loss')
         acc = trainer.callback_metrics.get('train_acc')
         
@@ -117,7 +116,6 @@ class EEG_Encoder_Module(pl.LightningModule):
         self.loss = nn.CrossEntropyLoss()
         self.cosine_lr_list = cosine_scheduler(1, 0.1, max_epochs, niter_per_ep, warmup_epochs=10)
         
-        # Metrics tracking during training
         self.train_acc = torchmetrics.Accuracy('multiclass', num_classes=config.n_classes)
         self.train_f1  = torchmetrics.F1Score('multiclass', num_classes=config.n_classes, average='macro')
 
@@ -131,7 +129,6 @@ class EEG_Encoder_Module(pl.LightningModule):
         logits = self.model(x)
         loss = self.loss(logits, y)
         
-        # Log metrics for the callback
         acc = self.train_acc(logits, y)
         f1 = self.train_f1(logits, y)
         
@@ -142,14 +139,10 @@ class EEG_Encoder_Module(pl.LightningModule):
         return loss
 
 def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pretrain=None):
-    """
-    Train per subject, report metrics, and save learning curve.
-    """
     seed_all(42)
     Pred, Real = [], []
     kf = KFold(n_splits=5, shuffle=False)
     
-    # Store history for all 5 folds to plot average later
     fold_histories = []
 
     fold_idx = 0
@@ -158,7 +151,6 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         x_test, y_test = Data_X[_test_idx], Data_Y[_test_idx]
 
         train_data = BasicDataset(x_train, y_train)
-        # Increased workers to 4 for better GPU saturation
         train_loader = DataLoader(train_data, batch_size=len(x_train), shuffle=True, num_workers=4, pin_memory=True)
         test_data = BasicDataset(x_test, y_test)
         test_loader = DataLoader(test_data, batch_size=len(x_test), shuffle=False, num_workers=4, pin_memory=True)
@@ -169,7 +161,6 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
 
         print(f"Fold {fold_idx+1}/5 | {yellow(logf)} | Train: {x_train.shape} | Test: {x_test.shape}")
         
-        # Attach history callback
         history_cb = HistoryCallback()
         
         trainer = pl.Trainer(
@@ -185,23 +176,17 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
         )
         
         trainer.fit(model, train_dataloaders=train_loader)
-        
-        # Save history for this fold
         fold_histories.append(history_cb.history['loss'])
         
-        # Optional: Save fold model
         # torch.save(model.model.state_dict(), f"{Run}/{subject_id}_fold{fold_idx}.pth")
 
-        # Inference
         pred, real = inference_on_loader(model.model, test_loader)
         Pred.append(pred)
         Real.append(real)
         fold_idx += 1
         
-    # --- Post-Training Analysis ---
     Pred, Real = np.concatenate(Pred), np.concatenate(Real)
     
-    # 1. Calculate Final Metrics for this Subject
     final_acc = accuracy_score(Real, Pred)
     final_f1 = f1_score(Real, Pred, average='macro')
     
@@ -209,23 +194,35 @@ def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pret
     print(f"    Accuracy: {green(f'{final_acc:.4f}')}")
     print(f"    F1 Score: {green(f'{final_f1:.4f}')}")
     
-    # 2. Save Results to CSV
     np.savetxt(logf, np.array([Pred, Real]).T, delimiter=',', fmt='%d')
 
-    # 3. Generate Learning Curve (Average across 5 folds)
     if fold_histories:
         min_len = min([len(h) for h in fold_histories])
         avg_loss = np.mean([h[:min_len] for h in fold_histories], axis=0)
         
         plt.figure(figsize=(10, 6))
-        plt.plot(avg_loss, label=f'Subject {subject_id} Avg Loss', color='blue')
+        plt.plot(avg_loss, label=f'Sub {subject_id} Avg Loss', color='blue')
+        
+        min_loss_val = np.min(avg_loss)
+        min_loss_idx = np.argmin(avg_loss)
+        final_loss_val = avg_loss[-1]
+        
+        plt.annotate(f'Min: {min_loss_val:.4f}', 
+                     xy=(min_loss_idx, min_loss_val), 
+                     xytext=(min_loss_idx, min_loss_val + 0.2),
+                     arrowprops=dict(facecolor='green', shrink=0.05))
+        
+        plt.annotate(f'Final: {final_loss_val:.4f}', 
+                     xy=(len(avg_loss)-1, final_loss_val), 
+                     xytext=(len(avg_loss)-20, final_loss_val + 0.2),
+                     arrowprops=dict(facecolor='red', shrink=0.05))
+
         plt.title(f'Learning Curve - Subject {subject_id} (5-Fold Avg)')
         plt.xlabel('Epochs')
         plt.ylabel('Training Loss')
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.legend()
         
-        # Save plot to Results/FAST/sub_X_curve.png
         plot_path = f"{os.path.dirname(logf)}/sub_{subject_id}_curve.png"
         plt.savefig(plot_path)
         plt.close()
@@ -255,7 +252,7 @@ if __name__ == '__main__':
         seq_len=800,
         window_len=sfreq,
         slide_step=sfreq//2,
-        head='EEGNet_Encoder',
+        head='Conv4Layers',
         n_classes=5,
         num_layers=4,
         num_heads=8,
@@ -264,39 +261,78 @@ if __name__ == '__main__':
     
     X, Y = load_standardized_h5('Processed/BCIC2020Track3.h5')
     
+    global_acc = []
+    global_f1 = []
+    
+    # Keep track of which subject ID corresponds to which accuracy
+    subject_ids = []
+
     for fold in range(15):
         if fold not in args.folds:
             continue
         flog = f"{Run}/{fold}-Tune.csv"
         
-        # NOTE: Pass 'fold' as subject_id to track plots
         Finetune(config, X[fold], Y[fold], flog, subject_id=fold, max_epochs=200)
 
-    # --- Global Summary ---
-    print("\n========================================")
-    print("      ALL SUBJECTS EVALUATION COMPLETE    ")
-    print("========================================")
-    
-    # Re-read all generated CSVs to calculate global stats
-    all_accuracies = []
-    all_f1s = []
-    
-    for fold in range(15):
-        flog = f"{Run}/{fold}-Tune.csv"
-        if not os.path.exists(flog):
-            continue
-            
         data = np.loadtxt(flog, delimiter=',', dtype=int)
         pred, label = data[:, 0], data[:, 1]
         
         acc = accuracy_score(label, pred)
         f1 = f1_score(label, pred, average='macro')
         
-        all_accuracies.append(acc)
-        all_f1s.append(f1)
+        global_acc.append(acc)
+        global_f1.append(f1)
+        subject_ids.append(fold)
+        
+        mean_acc = np.mean(global_acc)
+        mean_f1 = np.mean(global_f1)
+        print(f"    [Rolling Average (N={len(global_acc)})] Acc: {green(f'{mean_acc:.4f}')} | F1: {green(f'{mean_f1:.4f}')}")
+        print("    --------------------------------------------------")
 
-    if all_accuracies:
-        print(f"Overall Average Accuracy: {np.mean(all_accuracies):.4f} ± {np.std(all_accuracies):.4f}")
-        print(f"Overall Average F1 Score: {np.mean(all_f1s):.4f} ± {np.std(all_f1s):.4f}")
+    # --- Final Summary & Visualization ---
+    print("\n========================================")
+    print("      ALL SUBJECTS EVALUATION COMPLETE    ")
+    print("========================================")
+    
+    if global_acc:
+        avg_acc = np.mean(global_acc)
+        std_acc = np.std(global_acc)
+        
+        print(f"Final Average Accuracy: {avg_acc:.4f} ± {std_acc:.4f}")
+        print(f"Final Average F1 Score: {np.mean(global_f1):.4f} ± {np.std(global_f1):.4f}")
+        
+        # --- NEW: Breakdown Plot ---
+        plt.figure(figsize=(12, 6))
+        
+        # Bar chart for individual subjects
+        bars = plt.bar(subject_ids, global_acc, color='skyblue', edgecolor='black', alpha=0.7, label='Subject Accuracy')
+        
+        # Horizontal line for global average
+        plt.axhline(y=avg_acc, color='red', linestyle='--', linewidth=2, label=f'Mean ({avg_acc:.2f})')
+        
+        # Shaded area for Std Dev
+        plt.fill_between([min(subject_ids)-0.5, max(subject_ids)+0.5], 
+                         avg_acc - std_acc, avg_acc + std_acc, 
+                         color='red', alpha=0.1, label='Std Dev')
+
+        # Add labels on top of bars
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height,
+                     f'{height:.2f}',
+                     ha='center', va='bottom', fontsize=9)
+
+        plt.xticks(subject_ids)
+        plt.xlabel('Subject ID')
+        plt.ylabel('Accuracy')
+        plt.title('Accuracy Contribution Breakdown per Subject')
+        plt.legend(loc='lower right')
+        plt.grid(axis='y', linestyle='--', alpha=0.5)
+        
+        final_plot_path = f"{Run}/Global_Accuracy_Breakdown.png"
+        plt.savefig(final_plot_path)
+        plt.close()
+        print(f"\n[Visual] Breakdown plot saved to: {final_plot_path}")
+        
     else:
         print("No results found.")
