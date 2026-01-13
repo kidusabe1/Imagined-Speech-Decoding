@@ -58,6 +58,80 @@ class Conv4Layers(nn.Module):
         x = einops.reduce(x, 'B F 1 T -> B F', 'mean')
         return x
     
+class EEGNet_Encoder(nn.Module):
+    """
+    A specialized EEGNet implementation adapted for FAST's Zone-based tokenization.
+    
+    Architecture Breakdown:
+    1. Temporal Conv: Learn frequency filters (Alpha, Beta, Gamma).
+    2. Spatial Conv: Learn spatial patterns (Common Spatial Patterns).
+    3. Separable Conv: Learn temporal patterns efficiently.
+    """
+    def __init__(self, in_channels, feature_dim, kernel_length=64, dropout=0.25):
+        super().__init__()
+        
+        # F1: Number of temporal filters
+        # D:  Depth multiplier (Spatial filters per temporal filter)
+        # F2: Total number of pointwise filters (F1 * D)
+        self.F1 = 8
+        self.D = 2
+        self.F2 = self.F1 * self.D
+        
+        # Block 1: Temporal Convolution
+        # Kernel: (1, 64) -> Convolves only across Time, keeping Electrodes separate.
+        # This acts like a learnable Bandpass filter bank.
+        self.temporal_conv = nn.Sequential(
+            nn.Conv2d(1, self.F1, (1, kernel_length), padding=(0, kernel_length // 2), bias=False),
+            nn.BatchNorm2d(self.F1)
+        )
+        
+        # Block 2: Spatial Convolution (Depthwise)
+        # Kernel: (in_channels, 1) -> Convolves only across Electrodes, keeping Time separate.
+        # Groups=F1 makes it "Depthwise": Each temporal filter gets its own spatial filter.
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(self.F1, self.F2, (in_channels, 1), groups=self.F1, bias=False),
+            nn.BatchNorm2d(self.F2),
+            nn.ELU(),                    # ELU is preferred over ReLU for EEG
+            nn.AvgPool2d((1, 4)),        # Downsample time by 4
+            nn.Dropout(dropout)
+        )
+        
+        # Block 3: Separable Convolution
+        # Decouples filtering (Depthwise) from mixing (Pointwise) to save parameters.
+        self.separable_conv = nn.Sequential(
+            nn.Conv2d(self.F2, self.F2, (1, 16), padding=(0, 8), groups=self.F2, bias=False), # Depthwise
+            nn.Conv2d(self.F2, self.F2, (1, 1), bias=False),                                  # Pointwise
+            nn.BatchNorm2d(self.F2),
+            nn.ELU(),
+            nn.AvgPool2d((1, 8)),        # Downsample time by 8
+            nn.Dropout(dropout)
+        )
+        
+        # Final Projection
+        # Collapses the remaining time dimension to produce a fixed-size token.
+        self.projector = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(self.F2, feature_dim)
+        )
+
+    def forward(self, x):
+        # Input x: (Batch, Zone_Channels, Time) e.g., (32, 8, 800)
+        
+        # 1. Add "Channel" dimension for 2D Conv
+        # x -> (Batch, 1, Zone_Channels, Time)
+        x = x.unsqueeze(1)
+        
+        x = self.temporal_conv(x)
+        x = self.spatial_conv(x)
+        x = self.separable_conv(x)
+        
+        # 2. Project to Feature Token
+        # Output: (Batch, Feature_Dim) e.g., (32, 32)
+        x = self.projector(x)
+        return x
+
+    
 class HeadConv_Paper_Version(nn.Module):
     def __init__(self, in_channels, feature_dim=32):
         super().__init__()
@@ -203,7 +277,7 @@ if __name__ == '__main__':
         seq_len=1000,
         window_len=sfreq,
         slide_step=sfreq//2,
-        head='Conv4Layers',
+        head='EEGNet_Encoder',
         n_classes=5,
         num_layers=4,
         num_heads=8,
