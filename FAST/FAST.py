@@ -40,6 +40,87 @@ class AttentionBlock(nn.Module):
         x = x + self.linear(self.layer_norm_2(x))
         return x
 
+class CVBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        # Parameters from the text
+        self.C = len(config.electrodes)  # Number of EEG Channels
+        self.F1 = 8                      # Number of temporal filters (adjustable)
+        self.D = 2                       # Depth multiplier
+        self.F2 = 16                     # Number of pointwise filters (F1 * D = 16)
+        
+        # Kernel Sizes (based on 250Hz sampling rate)
+        # Kc = Fs / 4 = 250 / 4 = 62.5 -> approx 64
+        self.Kc = 64  
+        # Kc2 = 16 (for 500ms decoding at reduced rate)
+        self.Kc2 = 16 
+        
+        # --- LAYER 1: Temporal Convolution ---
+        # Extracts frequency info > 4Hz
+        self.conv1 = nn.Conv2d(1, self.F1, (1, self.Kc), padding=(0, self.Kc // 2), bias=False)
+        self.bn1 = nn.BatchNorm2d(self.F1)
+        
+        # --- LAYER 2: Depthwise Spatial Convolution ---
+        # Each filter learns from 1 channel. drastically reduces parameters.
+        self.conv2 = nn.Conv2d(self.F1, self.F1 * self.D, (self.C, 1), 
+                               groups=self.F1, bias=False)
+        self.bn2 = nn.BatchNorm2d(self.F1 * self.D)
+        self.act1 = nn.ELU()
+        
+        # Pooling 1: Reduces 250Hz -> ~32Hz (Factor of 8)
+        self.pool1 = nn.AvgPool2d((1, 8))
+        self.dropout1 = nn.Dropout(config.dropout)
+        
+        # --- LAYER 3: Temporal Convolution 2 ---
+        # Decodes 500ms windows
+        self.conv3 = nn.Conv2d(self.F1 * self.D, self.F2, (1, self.Kc2), 
+                               padding=(0, self.Kc2 // 2), bias=False)
+        self.bn3 = nn.BatchNorm2d(self.F2)
+        self.act2 = nn.ELU()
+        
+        # Pooling 2: Control sequence length
+        # We want a sequence for the transformer, so we keep this moderate
+        self.pool2 = nn.AvgPool2d((1, 2)) 
+        self.dropout2 = nn.Dropout(config.dropout)
+
+        # Projection to match Transformer Dimension (dim_token)
+        # Output of conv3 is F2 (16), but FAST might need 32 or 64
+        self.projector = nn.Linear(self.F2, config.dim_token)
+
+    def forward(self, x):
+        # Input: (Batch, Channels, Time) -> Needs (Batch, 1, Channels, Time)
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+            
+        # Layer 1: Temporal
+        x = self.conv1(x)
+        x = self.bn1(x)
+        
+        # Layer 2: Spatial (Depthwise)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.act1(x)
+        x = self.pool1(x)
+        x = self.dropout1(x)
+        
+        # Layer 3: Temporal 2
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.act2(x)
+        x = self.pool2(x)
+        x = self.dropout2(x)
+        
+        # Prepare for Transformer
+        # Current Shape: (Batch, F2, 1, Time')
+        x = x.squeeze(2)          # (Batch, F2, Time')
+        x = x.transpose(1, 2)     # (Batch, Time', F2) -> Sequence format
+        
+        # Project to correct embedding dimension
+        x = self.projector(x)     # (Batch, Time', dim_token)
+        
+        return x
+
 class Conv4Layers(nn.Module):
     def __init__(self, channels, dim=32):
         super().__init__()
