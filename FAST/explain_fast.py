@@ -30,10 +30,26 @@ CONFIG = PretrainedConfig(
 )
 
 def load_model(checkpoint_path, config):
+    """
+    Loads FAST model weights (state_dict) into the architecture.
+    """
     model = FAST(config)
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint: {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+        
+        # --- FIX: Add weights_only=False ---
+        # We also check if it's a Lightning checkpoint (which nests weights under 'state_dict')
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        
+        if 'state_dict' in checkpoint:
+            # If loading a PL checkpoint, weights might have 'model.' prefix
+            state_dict = checkpoint['state_dict']
+            # Remove 'model.' prefix if it exists (common in Lightning modules)
+            state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
+        else:
+            state_dict = checkpoint
+            
+        model.load_state_dict(state_dict)
     else:
         print("Warning: Checkpoint not found. Using random weights for testing.")
     model.eval()
@@ -59,16 +75,54 @@ def prepare_shap_data(data_path, fold_idx=0, n_bg=50, n_test=5):
     return X_bg, X_test, Y_test
 
 def run_shap_analysis(model, X_background, X_test):
+    """
+    Performs SHAP analysis using GradientExplainer.
+    Robustly handles both List output and Stacked Array output formats.
+    """
     print("Initializing SHAP GradientExplainer...")
+    print(f"  Background samples: {len(X_background)}")
+    print(f"  Test samples: {len(X_test)}")
+    
     eeg_explainer = shap.GradientExplainer(model, X_background)
     
     print(f"Computing SHAP values for {len(X_test)} samples...")
     shap_values = eeg_explainer.shap_values(X_test)
 
+    # --- FIX: Detect and Unpack Single Array Output ---
+    # Case 1: SHAP returns a single array (Batch, Channels, Time, Classes)
+    # We need to convert it to -> List of [ (Batch, Channels, Time) ] per class
+    if not isinstance(shap_values, list):
+        print(f"  -> Detected single SHAP array of shape {shap_values.shape}")
+        
+        # If shape is (Batch, Channels, Time, Classes) -> (50, 64, 800, 5)
+        if shap_values.ndim == 4 and shap_values.shape[-1] == 5:
+            print("  -> Unpacking (Batch, Channels, Time, Classes) into List of Classes...")
+            # 1. Transpose to (Classes, Batch, Channels, Time)
+            shap_values = np.transpose(shap_values, (3, 0, 1, 2))
+            # 2. Convert to list of numpy arrays
+            shap_values = [shap_values[i] for i in range(shap_values.shape[0])]
+            
+        # If shape is (Batch, Classes, Channels, Time) -> (50, 5, 64, 800)
+        elif shap_values.ndim == 4 and shap_values.shape[1] == 5:
+             print("  -> Unpacking (Batch, Classes, Channels, Time) into List of Classes...")
+             shap_values = np.transpose(shap_values, (1, 0, 2, 3))
+             shap_values = [shap_values[i] for i in range(shap_values.shape[0])]
+
+    # --- Standard Check for Transposed Dimensions ---
+    # Sometimes output is (Classes x [Channels, Time, Batch]) instead of [Batch, Channels, Time]
     expected_batch = len(X_test)
-    if shap_values[0].shape[0] != expected_batch and shap_values[0].shape[-1] == expected_batch:
-        print(f"   -> Transposing from (Channels, Time, Batch) to (Batch, Channels, Time)...")
-        shap_values = [np.transpose(s, (2, 0, 1)) for s in shap_values]
+    
+    # Check the first class array
+    if isinstance(shap_values, list) and len(shap_values) > 0:
+        s_shape = shap_values[0].shape
+        # If Batch is the LAST dimension (e.g. 64, 800, 50)
+        if s_shape[0] != expected_batch and s_shape[-1] == expected_batch:
+            print(f"  -> Transposing dimensions from {s_shape} to (Batch, Channels, Time)...")
+            shap_values = [np.transpose(s, (2, 0, 1)) for s in shap_values]
+
+    print(f"SHAP computation complete!")
+    print(f"  Number of classes detected: {len(shap_values)} (Should be 5)")
+    print(f"  Shape per class: {shap_values[0].shape} (Should be {expected_batch}, 64, 800)")
     
     return shap_values
 
@@ -227,7 +281,7 @@ def plot_grand_average_topomap(shap_values, Y_test, target_class_idx, electrodes
     plt.close()
     print(f"Saved Grand Average Map to: {output_file}")
 
-    
+
 def plot_zone_importance(shap_values, sample_idx=0, class_idx=0, electrodes=Electrodes,
                           zones=Zones, output_dir='shap_outputs', true_label=None):
     """
@@ -305,11 +359,11 @@ def generate_all_visualizations(shap_values, Y_test, electrodes=Electrodes, zone
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', type=str, default='Results/FAST/6_best.pth')
+    parser.add_argument('--checkpoint', type=str, default='/home/kay/FAST/best-checkpoint.ckpt')
     parser.add_argument('--data', type=str, default='Processed/BCIC2020Track3.h5')
-    parser.add_argument('--fold', type=int, default=6)
+    parser.add_argument('--fold', type=int, default=1)
     parser.add_argument('--n_bg', type=int, default=125)
-    parser.add_argument('--n_test', type=int, default=5)
+    parser.add_argument('--n_test', type=int, default=50)
     parser.add_argument('--output_dir', type=str, default='shap_outputs')
     args = parser.parse_args()
     
@@ -331,7 +385,7 @@ def main():
     n_classes = len(shap_vals)
     for c in range(n_classes):
         plot_grand_average_topomap(shap_vals, Y_explain, target_class_idx=c, electrodes=Electrodes, output_dir=args.output_dir)
-
+    
     print("\nComplete!")
 
 if __name__ == '__main__':
