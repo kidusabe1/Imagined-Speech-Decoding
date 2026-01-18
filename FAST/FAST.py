@@ -41,86 +41,91 @@ class AttentionBlock(nn.Module):
         return x
 
 class CVBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, n_channels, dim_token, dropout=0.5):
         super().__init__()
         
-        # Parameters from the text
-        self.C = len(config.electrodes)  # Number of EEG Channels
-        self.F1 = 8                      # Number of temporal filters (adjustable)
-        self.D = 2                       # Depth multiplier
-        self.F2 = 16                     # Number of pointwise filters (F1 * D = 16)
+        self.C = n_channels
+        self.F1 = 8                      
+        self.D = 2                       
+        self.F2 = 16                     
         
-        # Kernel Sizes (based on 250Hz sampling rate)
-        # Kc = Fs / 4 = 250 / 4 = 62.5 -> approx 64
-        self.Kc = 64  
-        # Kc2 = 16 (for 500ms decoding at reduced rate)
-        self.Kc2 = 16 
+        # Kernel Sizes
+        self.Kc = 64   
+        self.Kc2 = 16  
         
-        # --- LAYER 1: Temporal Convolution ---
-        # Extracts frequency info > 4Hz
+        # --- Layers 1 & 2 (Same as before) ---
         self.conv1 = nn.Conv2d(1, self.F1, (1, self.Kc), padding=(0, self.Kc // 2), bias=False)
         self.bn1 = nn.BatchNorm2d(self.F1)
         
-        # --- LAYER 2: Depthwise Spatial Convolution ---
-        # Each filter learns from 1 channel. drastically reduces parameters.
         self.conv2 = nn.Conv2d(self.F1, self.F1 * self.D, (self.C, 1), 
                                groups=self.F1, bias=False)
         self.bn2 = nn.BatchNorm2d(self.F1 * self.D)
         self.act1 = nn.ELU()
-        
-        # Pooling 1: Reduces 250Hz -> ~32Hz (Factor of 8)
         self.pool1 = nn.AvgPool2d((1, 8))
-        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout1 = nn.Dropout(dropout)
         
-        # --- LAYER 3: Temporal Convolution 2 ---
-        # Decodes 500ms windows
+        # --- Layer 3 ---
         self.conv3 = nn.Conv2d(self.F1 * self.D, self.F2, (1, self.Kc2), 
                                padding=(0, self.Kc2 // 2), bias=False)
         self.bn3 = nn.BatchNorm2d(self.F2)
         self.act2 = nn.ELU()
         
-        # Pooling 2: Control sequence length
-        # We want a sequence for the transformer, so we keep this moderate
+        # NOTE: We use pool2 to control the sequence length.
+        # If input window is 200 (sfreq), pool1(8) -> 25. pool2(2) -> ~12 time steps.
         self.pool2 = nn.AvgPool2d((1, 2)) 
-        self.dropout2 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
-        # Projection to match Transformer Dimension (dim_token)
-        # Output of conv3 is F2 (16), but FAST might need 32 or 64
-        self.projector = nn.Linear(self.F2, config.dim_token)
+        # --- DYNAMIC DIMENSION CALCULATION ---
+        # We need to calculate the flattened size to define the Linear layer correctly.
+        # This prevents shape mismatch errors regardless of your window size.
+        with torch.no_grad():
+            # Create a dummy input representing (1, 1, Channels, WindowLen)
+            # WindowLen is typically sfreq (250) or config.window_len
+            dummy_window_len = 250 # Adjust if your sfreq/window_len is different!
+            dummy_input = torch.zeros(1, 1, n_channels, dummy_window_len)
+            
+            # Pass through layers to check output size
+            x = self.conv1(dummy_input)
+            x = self.pool1(self.act1(self.bn2(self.conv2(self.bn1(x)))))
+            x = self.pool2(self.act2(self.bn3(self.conv3(x))))
+            
+            # The flattened size is Channels * Height * Width
+            self.flat_dim = x.shape[1] * x.shape[2] * x.shape[3]
+            # print(f"DEBUG: CVBlock Flattened Output Size: {self.flat_dim}")
+
+        # Projection: Maps the massive flattened sequence to the compact Transformer token
+        self.projector = nn.Linear(self.flat_dim, dim_token)
 
     def forward(self, x):
-        # Input: (Batch, Channels, Time) -> Needs (Batch, 1, Channels, Time)
+        # Input: (Batch, Channels, Time)
         if x.dim() == 3:
             x = x.unsqueeze(1)
             
-        # Layer 1: Temporal
         x = self.conv1(x)
         x = self.bn1(x)
         
-        # Layer 2: Spatial (Depthwise)
         x = self.conv2(x)
         x = self.bn2(x)
         x = self.act1(x)
         x = self.pool1(x)
         x = self.dropout1(x)
         
-        # Layer 3: Temporal 2
         x = self.conv3(x)
         x = self.bn3(x)
         x = self.act2(x)
         x = self.pool2(x)
         x = self.dropout2(x)
         
-        # Prepare for Transformer
+        # --- THE FIX: FLATTEN (Preserves Time) ---
         # Current Shape: (Batch, F2, 1, Time')
-        x = x.squeeze(2)          # (Batch, F2, Time')
-        x = x.transpose(1, 2)     # (Batch, Time', F2) -> Sequence format
+        # Flatten all dimensions except Batch
+        x = x.flatten(start_dim=1)  # Shape: (Batch, F2 * Time')
         
-        # Project to correct embedding dimension
-        x = self.projector(x)     # (Batch, Time', dim_token)
+        # Project to correct embedding size
+        x = self.projector(x)       # Shape: (Batch, dim_token)
         
         return x
-
+    
 class Conv4Layers(nn.Module):
     def __init__(self, channels, dim=32):
         super().__init__()
@@ -358,7 +363,7 @@ if __name__ == '__main__':
         seq_len=1000,
         window_len=sfreq,
         slide_step=sfreq//2,
-        head='EEGNet_Encoder',
+        head='CVBlock',
         n_classes=5,
         num_layers=4,
         num_heads=8,

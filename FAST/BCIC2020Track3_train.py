@@ -255,7 +255,8 @@ def Pretrain_LOSO(config, All_X, All_Y, target_subject_idx, save_dir, max_epochs
     return ckpt_path
 
 # --- FIXED: Finetune (Added num_sanity_val_steps=0) ---
-def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pretrain=None, num_workers=4):
+def Finetune(config, Data_X, Data_Y, logf, subject_id, max_epochs=200, ckpt_pretrain=None, num_workers=0
+):
     seed_all(42)
     Pred, Real = [], []
     kf = KFold(n_splits=5, shuffle=False)
@@ -418,7 +419,7 @@ if __name__ == '__main__':
     else:
         args.folds = [int(x) for x in args.folds.split(',')]
 
-    Run = "Results/FAST/"
+    Run = "Results_finetune/FAST/"
     os.makedirs(f"{Run}", exist_ok=True)
 
     sfreq = 250
@@ -448,16 +449,16 @@ if __name__ == '__main__':
         
         flog = f"{Run}/{fold}-Tune.csv"
         
-        # 1. Pretrain (LOSO)
-        pretrained_path = Pretrain_LOSO(
-            config, X, Y, target_subject_idx=fold, save_dir=Run, 
-            max_epochs=50, num_workers=args.workers
-        )
+        # # 1. Pretrain (LOSO)
+        # pretrained_path = Pretrain_LOSO(
+        #     config, X, Y, target_subject_idx=fold, save_dir=Run, 
+        #     max_epochs=50, num_workers=3
+        # )
         
         # 2. Finetune (LOFO)
         Finetune(
             config, X[fold], Y[fold], flog, subject_id=fold, 
-            max_epochs=200, ckpt_pretrain=pretrained_path, num_workers=0
+            max_epochs=200, num_workers=0
         )
 
         # Global stats logic...
@@ -468,13 +469,36 @@ if __name__ == '__main__':
         print(f"    Rolling Avg Acc: {green(f'{np.mean(global_acc):.4f}')}")
         print("    --------------------------------------------------")
 
-    # Final Summary Plot
+# Final Summary Plot
     if global_acc:
         avg = np.mean(global_acc)
         print(f"Final Average Accuracy: {avg:.4f}")
+        
         plt.figure(figsize=(12, 6))
-        plt.bar(subject_ids, global_acc, color='skyblue', edgecolor='black')
-        plt.axhline(y=avg, color='red', linestyle='--')
-        plt.title('Accuracy Contribution Breakdown per Subject')
-        plt.savefig(f"{Run}/Global_Accuracy_Breakdown.png")
+        
+        # 1. Create Bar Plot and capture the bar objects
+        bars = plt.bar(subject_ids, global_acc, color='skyblue', edgecolor='black')
+        
+        # 2. Add Mean Line with a Label
+        plt.axhline(y=avg, color='red', linestyle='--', linewidth=2, label=f'Mean: {avg:.4f}')
+        
+        # 3. Add Values on Top of Each Bar
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(
+                bar.get_x() + bar.get_width() / 2.0,  # X: Center of bar
+                height,                               # Y: Top of bar
+                f'{height:.2f}',                      # Text: Value to 2 decimal places
+                ha='center', va='bottom',             # Alignment
+                fontsize=10, fontweight='bold'
+            )
+        
+        # 4. Final Formatting
+        plt.title('Accuracy Contribution Breakdown per Subject', fontsize=14)
+        plt.xlabel('Subject ID', fontsize=12)
+        plt.ylabel('Accuracy', fontsize=12)
+        plt.ylim(0, max(global_acc) * 1.15) # Add headroom for labels
+        plt.legend() # Displays the mean label
+        
+        plt.savefig(f"{Run}/Global_Accuracy_Breakdown.png", bbox_inches='tight')
         plt.close()
