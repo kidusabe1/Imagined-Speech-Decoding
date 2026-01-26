@@ -1,9 +1,4 @@
-"""
-Decoding Covert Speech from EEG Using a Functional Areas Spatio-Temporal Transformer (FAST)
-Code for reproducing results on BCI Competition 2020 Track #3: Imagined Speech Classification.
-Currently under review for publication.
-Contact: James Jiang Muyun (james.jiang@ntu.edu.sg)
-"""
+
 
 import json
 import os
