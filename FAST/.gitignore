@@ -3,11 +3,23 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Data & Results (project-specific)
 BCIC2020Track3/
 Processed/
+data/
+results/
+checkpoints/
+logs/
 Results/
-Results_Debug/
+Results_*/
 debug_FAST_BCIC2020Track3.py
+shap_outputs*/
+artifact_analysis/
+EEGNET_HEAD_Results*/
+*.h5
+*.mat
+*.pth
+*.ckpt
 
 # C extensions
 *.so
