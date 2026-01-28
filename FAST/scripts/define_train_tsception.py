@@ -273,6 +273,7 @@ def Train_Subject_LOFO(Data_X, Data_Y, logf, subject_id, max_epochs, gpu_id):
 
     # --- TRACK BEST FOLD ---
     best_fold_acc = -1.0
+    best_model_path = None
     # -----------------------
 
     fold_idx = 0
@@ -382,7 +383,8 @@ def Train_Subject_LOFO(Data_X, Data_Y, logf, subject_id, max_epochs, gpu_id):
             
             # Save the inner PyTorch model weights
             torch.save(model.model.state_dict(), save_path)
-            print(f"    [Save] New Best Model for Subject {subject_id} (Fold {fold_idx+1}, Acc: {green(f'{acc:.4f}')}) -> {save_path}")
+            best_model_path = save_path
+            print(f"    [Save] New Best Model for Subject {subject_id} (Fold {fold_idx+1}, Acc: {green(f'{acc:.4f}')} ) -> {save_path}")
         # -----------------------------
         
         fold_metrics.append([fold_idx, acc, f1])
@@ -407,7 +409,7 @@ def Train_Subject_LOFO(Data_X, Data_Y, logf, subject_id, max_epochs, gpu_id):
             f.write(f"{int(row[0])},{row[1]:.5f},{row[2]:.5f}\n")
         f.write(f"\nMEAN,{np.mean(metrics_arr[:, 1]):.5f},{np.mean(metrics_arr[:, 2]):.5f}\n")
 
-    return final_acc
+    return final_acc, best_model_path
 
 # ==============================================================================
 # ENTRY POINT
@@ -427,7 +429,10 @@ if __name__ == '__main__':
     Run_Name = "Results_TSception_LOFO"
     os.makedirs(Run_Name, exist_ok=True)
     
-    X_All, Y_All = load_standardized_h5('Processed/BCIC2020Track3.h5')
+    # Train/val combined (from preprocessing cache)
+    X_All, Y_All = load_standardized_h5('/home/kay/FAST/FAST/Processed/BCIC2020Track3.h5')
+    # Official test set per subject (kept strictly for final evaluation)
+    X_Test_All, Y_Test_All = load_standardized_h5('/home/kay/FAST/FAST/Processed/BCIC2020Track3_Test.h5')
     
     global_accuracies = []
     
@@ -441,7 +446,7 @@ if __name__ == '__main__':
 
         log_file = f"{Run_Name}/sub-{subject_idx}_preds.csv"
         
-        acc = Train_Subject_LOFO(
+        acc, best_model_path = Train_Subject_LOFO(
             X_All[subject_idx], 
             Y_All[subject_idx], 
             log_file, 
@@ -449,7 +454,40 @@ if __name__ == '__main__':
             max_epochs=200, 
             gpu_id=args.gpu
         )
-        
+
+        # --- Final test evaluation using official test set ---
+        if best_model_path is not None:
+            test_x = X_Test_All[subject_idx]
+            test_y = Y_Test_All[subject_idx]
+            test_loader = DataLoader(BasicDataset(test_x, test_y), batch_size=32, shuffle=False, num_workers=0)
+
+            device = f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
+            eval_model = TSception(
+                num_classes=5,
+                input_size=(1, test_x.shape[1], test_x.shape[2]),
+                sampling_rate=250,
+                num_T=15,
+                num_S=15,
+                hidden=128,
+                dropout_rate=0.5
+            ).to(device)
+            state_dict = torch.load(best_model_path, map_location=device)
+            eval_model.load_state_dict(state_dict)
+            pred_test, real_test = inference_on_loader(eval_model, test_loader, device=device)
+            test_acc = accuracy_score(real_test, pred_test)
+            test_f1 = f1_score(real_test, pred_test, average='macro')
+
+            test_metrics_path = os.path.join(Run_Name, f"sub-{subject_idx}_test_metrics.csv")
+            with open(test_metrics_path, 'w') as f:
+                f.write("Accuracy,F1_Score\n")
+                f.write(f"{test_acc:.5f},{test_f1:.5f}\n")
+
+            test_preds_path = os.path.join(Run_Name, f"sub-{subject_idx}_test_preds.csv")
+            np.savetxt(test_preds_path, np.array([pred_test, real_test]).T, delimiter=',', fmt='%d')
+            print(f"    [Test] Subject {subject_idx} | Acc: {green(f'{test_acc:.4f}')} | F1: {test_f1:.4f}")
+        else:
+            print(f"    [Test] Skipped test evaluation for Subject {subject_idx} (no saved best model)")
+
         global_accuracies.append(acc)
         print("--------------------------------------------------")
 
