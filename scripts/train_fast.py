@@ -95,7 +95,10 @@ def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=6
         X_sub, Y_sub = load_subject_train_val(base_folder, SID)
         print(f"Subject {SID} data: {X_sub.shape}, labels: {np.unique(Y_sub, return_counts=True)}")
 
-        kf = KFold(n_splits=args.n_folds, shuffle=(args.split_mode == 'ours'), random_state=args.seed)
+        if args.split_mode == 'ours':
+            kf = KFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+        else:
+            kf = KFold(n_splits=args.n_folds, shuffle=False)
         fold_metrics = []
         best_fold_acc = -np.inf
         best_fold_ckpt = None
@@ -164,15 +167,31 @@ def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=6
                 trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
             if args.split_mode == 'github':
+                # Evaluate on KFold held-out fold (baseline behavior)
+                y_pred, y_true = inference_on_loader(model.model, val_loader)
+                fold_acc = accuracy_score(y_true, y_pred)
+                fold_f1 = f1_score(y_true, y_pred, average='macro')
+                fold_metrics.append([fold_idx, fold_acc])
+                np.savetxt(
+                    os.path.join(save_dir, f"sub-{SID}", f"fold-{fold_idx}_predictions.csv"),
+                    np.array([y_pred, y_true]).T, delimiter=',', fmt='%d', header='Predicted,True'
+                )
+                print(f"  Fold {fold_idx+1}: Acc={fold_acc:.4f}, F1={fold_f1:.4f}")
                 fold_best = float('nan')
-                fold_metrics.append([fold_idx, fold_best])
             else:
                 fold_best = float(ckpt_cb.best_model_score) if ckpt_cb and ckpt_cb.best_model_score is not None else float('nan')
                 fold_metrics.append([fold_idx, fold_best])
 
             # Save fold learning curves
-            if all(len(v) > 0 for v in history_cb.history.values()):
-                min_len = min(len(v) for v in history_cb.history.values())
+            if args.split_mode == 'github':
+                has_train = len(history_cb.history.get('loss', [])) > 0 or len(history_cb.history.get('acc', [])) > 0
+                should_save = has_train
+            else:
+                should_save = all(len(v) > 0 for v in history_cb.history.values())
+
+            if should_save:
+                non_empty = [v for v in history_cb.history.values() if len(v) > 0]
+                min_len = min(len(v) for v in non_empty) if non_empty else 0
                 clean_history = {k: v[:min_len] for k, v in history_cb.history.items()}
                 hist_path = os.path.join(fold_dir, f"fold-{fold_idx}_history.csv")
                 pd.DataFrame(clean_history).to_csv(hist_path, index_label='Epoch')
@@ -205,7 +224,8 @@ def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=6
                 plt.savefig(os.path.join(fold_dir, f"fold-{fold_idx}_curves.png"))
                 plt.close()
 
-            print(f"  Fold {fold_idx+1}: best val_acc={fold_best:.4f}")
+            if args.split_mode == 'ours':
+                print(f"  Fold {fold_idx+1}: best val_acc={fold_best:.4f}")
 
             if args.split_mode == 'ours' and ckpt_cb and ckpt_cb.best_model_path and fold_best > best_fold_acc:
                 best_fold_acc = fold_best
@@ -250,18 +270,6 @@ def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=6
                 global_true.append(y_true)
 
             subject_results.append([SID, best_fold_acc, test_acc, test_f1])
-        else:
-            # GitHub FAST baseline: evaluate on KFold held-out fold only
-            y_pred, y_true = inference_on_loader(model.model, val_loader)
-            fold_acc = accuracy_score(y_true, y_pred)
-            fold_f1 = f1_score(y_true, y_pred, average='macro')
-            fold_metrics.append([fold_idx, fold_acc])
-            np.savetxt(
-                os.path.join(save_dir, f"sub-{SID}", f"fold-{fold_idx}_predictions.csv"),
-                np.array([y_pred, y_true]).T, delimiter=',', fmt='%d', header='Predicted,True'
-            )
-            print(f"  Fold {fold_idx+1}: Acc={fold_acc:.4f}, F1={fold_f1:.4f}")
-
         if args.split_mode == 'github':
             # For github mode, summarize mean fold accuracy only
             df_folds = pd.DataFrame(fold_metrics, columns=['Fold', 'Acc'])

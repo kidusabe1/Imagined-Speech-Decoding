@@ -32,6 +32,28 @@ def load_global_predictions(results_dir):
     return df.iloc[:, 0].values, df.iloc[:, 1].values
 
 
+def load_fold_predictions(subject_folder):
+    """Load fold predictions for GitHub baseline mode."""
+    fold_files = sorted(
+        f for f in os.listdir(subject_folder)
+        if f.startswith("fold-") and f.endswith("_predictions.csv")
+    )
+    if not fold_files:
+        return []
+    preds = []
+    for fname in fold_files:
+        path = os.path.join(subject_folder, fname)
+        df = pd.read_csv(path)
+        if '# Predicted' in df.columns:
+            y_pred, y_true = df['# Predicted'].values, df['True'].values
+        elif 'Predicted' in df.columns and 'True' in df.columns:
+            y_pred, y_true = df['Predicted'].values, df['True'].values
+        else:
+            y_pred, y_true = df.iloc[:, 0].values, df.iloc[:, 1].values
+        preds.append((y_pred, y_true))
+    return preds
+
+
 def process_results(results_dir, model_name="FAST"):
     """Process results directory and compute metrics."""
     
@@ -50,13 +72,12 @@ def process_results(results_dir, model_name="FAST"):
             if os.path.isdir(subject_folder):
                 sid = int(item.replace("sub-", ""))
                 y_pred, y_true = load_subject_predictions(subject_folder)
-                
                 if y_pred is not None and y_true is not None:
                     acc = accuracy_score(y_true, y_pred)
                     f1 = f1_score(y_true, y_pred, average='macro')
                     precision = precision_score(y_true, y_pred, average='macro')
                     recall = recall_score(y_true, y_pred, average='macro')
-                    
+
                     subjects.append(sid)
                     metrics_list.append({
                         'Subject': sid,
@@ -66,6 +87,32 @@ def process_results(results_dir, model_name="FAST"):
                         'Recall': recall,
                         'N_samples': len(y_true)
                     })
+                    continue
+
+                # GitHub baseline: use fold predictions if test predictions are missing
+                fold_preds = load_fold_predictions(subject_folder)
+                if fold_preds:
+                    fold_acc = []
+                    fold_f1 = []
+                    fold_prec = []
+                    fold_rec = []
+                    n_samples = 0
+                    for y_pred_f, y_true_f in fold_preds:
+                        fold_acc.append(accuracy_score(y_true_f, y_pred_f))
+                        fold_f1.append(f1_score(y_true_f, y_pred_f, average='macro'))
+                        fold_prec.append(precision_score(y_true_f, y_pred_f, average='macro'))
+                        fold_rec.append(recall_score(y_true_f, y_pred_f, average='macro'))
+                        n_samples += len(y_true_f)
+
+                    subjects.append(sid)
+                    metrics_list.append({
+                        'Subject': sid,
+                        'Accuracy': float(np.mean(fold_acc)),
+                        'F1': float(np.mean(fold_f1)),
+                        'Precision': float(np.mean(fold_prec)),
+                        'Recall': float(np.mean(fold_rec)),
+                        'N_samples': n_samples
+                    })
 
     if not metrics_list:
         print(f"No subject predictions found in {model_folder}")
@@ -73,16 +120,16 @@ def process_results(results_dir, model_name="FAST"):
 
     df_subjects = pd.DataFrame(metrics_list)
     
-    # Compute global metrics from concatenated predictions
+    # Compute global metrics from concatenated predictions if available
     y_pred_global, y_true_global = load_global_predictions(model_folder)
-    
+
     if y_pred_global is not None and y_true_global is not None:
         global_acc = accuracy_score(y_true_global, y_pred_global)
         global_f1 = f1_score(y_true_global, y_pred_global, average='macro')
         global_precision = precision_score(y_true_global, y_pred_global, average='macro')
         global_recall = recall_score(y_true_global, y_pred_global, average='macro')
     else:
-        # Fall back to mean of per-subject metrics
+        # Fall back to mean of per-subject metrics (GitHub baseline)
         global_acc = df_subjects['Accuracy'].mean()
         global_f1 = df_subjects['F1'].mean()
         global_precision = df_subjects['Precision'].mean()

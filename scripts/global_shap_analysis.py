@@ -9,10 +9,10 @@ import scipy.signal
 from transformers import PretrainedConfig
 import gc # Garbage collection
 
-# Import from existing codebase
-from FAST import FAST
-from BCIC2020Track3_train import load_standardized_h5
-from BCIC2020Track3_preprocess import Electrodes, Zones, CLASSES
+# Import from current package
+from fast.models import FAST
+from fast.data.loaders import load_standardized_h5
+from fast.data.preprocess import Electrodes, Zones, CLASSES
 
 # --- CONFIGURATION ---
 sfreq = 250
@@ -259,8 +259,8 @@ def plot_zone_time_heatmap(avg_shap, electrodes, zone_dict, title, output_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', type=str, default='/home/kay/FAST/FAST/Results_finetune_only/FAST/') 
-    parser.add_argument('--data', type=str, default='/home/kay/FAST/FAST/Processed/BCIC2020Track3.h5')
+    parser.add_argument('--model_dir', type=str, default='results/finetune_official/FAST')
+    parser.add_argument('--data', type=str, default='Processed/BCIC2020Track3.h5')
     parser.add_argument('--n_bg', type=int, default=200)
     parser.add_argument('--n_test', type=int, default=100) # Number of samples to average per class
     parser.add_argument('--output_dir', type=str, default='shap_subject_analysis')
@@ -282,7 +282,8 @@ def main():
         print(f"==========================================")
         
         # 1. Load Model for this subject
-        ckpt_path = os.path.join(args.model_dir, f"{subject_idx}_best.pth")
+        sid = f"{subject_idx:02d}"
+        ckpt_path = os.path.join(args.model_dir, f"sub-{sid}", "best_subject.pth")
         model = load_model(ckpt_path, CONFIG, device)
         
         if model is None:
@@ -291,7 +292,8 @@ def main():
             
         # 2. Load Data for this subject
         # Note: We load more test samples to get a stable average
-        X_bg, X_explain, Y_explain = prepare_shap_data(args.data, subject_idx, args.n_bg, args.n_test)
+        fold_idx = subject_idx - 1
+        X_bg, X_explain, Y_explain = prepare_shap_data(args.data, fold_idx, args.n_bg, args.n_test)
         
         if X_bg is None:
             print(f"Skipping Subject {subject_idx}: No data found.")

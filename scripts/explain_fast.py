@@ -7,10 +7,10 @@ import matplotlib.pyplot as plt
 import mne  # <--- IMPORT MNE
 from transformers import PretrainedConfig
 
-# Import from existing codebase
-from FAST import FAST
-from BCIC2020Track3_train import load_standardized_h5
-from BCIC2020Track3_preprocess import Electrodes, Zones, CLASSES
+# Import from current package
+from fast.models import FAST
+from fast.data.loaders import load_standardized_h5
+from fast.data.preprocess import Electrodes, Zones, CLASSES
 
 # --- CONFIGURATION ---
 sfreq = 250
@@ -29,26 +29,27 @@ CONFIG = PretrainedConfig(
     dropout=0.1,
 )
 
-def load_model(checkpoint_path, config,device):
+def load_model(checkpoint_path, config, device):
     """
     Loads FAST model weights (state_dict) into the architecture.
     """
     model = FAST(config)
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint: {checkpoint_path}")
-        
+
         # --- FIX: Add weights_only=False ---
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        
+
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
             state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
         else:
             state_dict = checkpoint
-            
+
         model.load_state_dict(state_dict)
     else:
-        print("Warning: Checkpoint not found. Using random weights for testing.")
+        print("Error: Checkpoint not found. Aborting SHAP run.")
+        return None
     model.eval()
     model.to(device)
     return model
@@ -441,9 +442,9 @@ def generate_all_visualizations(shap_values, Y_test, electrodes=Electrodes, zone
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', type=str, default='/home/kay/FAST/FAST/Results_finetune_only/FAST/3_best.pth')
+    parser.add_argument('--checkpoint', type=str, default='results/finetune_official/FAST/sub-01/best_subject.pth')
     parser.add_argument('--data', type=str, default='Processed/BCIC2020Track3.h5')
-    parser.add_argument('--fold', type=int, default=3)
+    parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--n_bg', type=int, default=200)
     parser.add_argument('--n_test', type=int, default=150)
     parser.add_argument('--output_dir', type=str, default='shap_outputs_sub_3')
@@ -452,8 +453,8 @@ def main():
     if not os.path.exists(args.data):
         print(f"ERROR: Data file not found at {args.data}")
         return
-    
-        # --- GPU SETUP ---
+
+    # --- GPU SETUP ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running on device: {device}")
 
@@ -466,8 +467,10 @@ def main():
         for i in range(len(Electrodes), actual_n_channels):
             Electrodes.append(f"Ch{i}")
 
-    model = load_model(args.checkpoint, CONFIG,device)
-    shap_vals = run_shap_analysis(model, X_bg, X_explain,device)
+    model = load_model(args.checkpoint, CONFIG, device)
+    if model is None:
+        return
+    shap_vals = run_shap_analysis(model, X_bg, X_explain, device)
     generate_all_visualizations(shap_vals, Y_explain, Electrodes, Zones, args.output_dir)
     n_classes = len(shap_vals)
     for c in range(n_classes):
