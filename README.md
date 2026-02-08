@@ -77,15 +77,31 @@ Train the FAST model with 5-fold cross-validation per subject:
 python scripts/train_fast.py --gpu 0 --epochs 200 --batch_size 64
 ```
 
+**Baseline parity mode (GitHub FAST)**
+
+To match the original GitHub FAST evaluation (unshuffled KFold, full-batch training,
+no validation-based model selection, and no official test set):
+```bash
+python scripts/train_fast.py --split_mode github
+```
+
+**Our stricter split (default in this repo)**
+
+To use shuffled KFold, validation-based model selection, and official test set evaluation:
+```bash
+python scripts/train_fast.py --split_mode ours
+```
+
 Available arguments:
 - `--config`: Path to YAML config file (default: `configs/default.yaml`)
 - `--gpu`: GPU device ID (default: 0)
 - `--epochs`: Max training epochs (default: 200)
-- `--batch_size`: Batch size (default: 64)
+- `--batch_size`: Batch size (default: 64; ignored in `--split_mode github`)
 - `--n_folds`: Number of CV folds (default: 5)
 - `--seed`: Random seed (default: 42)
 - `--data_folder`: Path to BCIC2020Track3 folder
 - `--output_dir`: Results output directory
+- `--split_mode`: `github` (baseline parity) or `ours` (strict evaluation)
 
 ### Evaluation
 
@@ -109,6 +125,9 @@ results/finetune_official/FAST/
 ├── global_test_predictions.csv  # All test predictions
 └── global_subject_accuracy.png  # Accuracy bar chart
 ```
+
+In `--split_mode github`, summaries report mean fold accuracy only and no official
+test set files are produced.
 
 ## Citation
 

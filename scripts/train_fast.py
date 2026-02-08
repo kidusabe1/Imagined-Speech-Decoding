@@ -68,15 +68,19 @@ def resolve_excel_path(base_folder: str, excel_path: str | None) -> str:
 def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=64):
     """
     Finetune per subject with 5-fold CV on that subject's train+validation data.
-    Saves the best checkpoint (highest val_acc) per subject and reports test metrics.
+    Behavior depends on args.split_mode:
+      - github: no shuffle, no validation selection, no official test set
+      - ours:   shuffled KFold, model selection on val_acc, test set evaluation
     """
     seed_all(args.seed)
 
     base_folder = resolve_data_folder(args.data_folder)
-    excel_path = resolve_excel_path(base_folder, args.excel_path)
-
-    # Preload test data per subject
-    test_per_subject = load_test_set_per_subject(base_folder, excel_path)
+    excel_path = None
+    test_per_subject = None
+    if args.split_mode == 'ours':
+        excel_path = resolve_excel_path(base_folder, args.excel_path)
+        # Preload test data per subject
+        test_per_subject = load_test_set_per_subject(base_folder, excel_path)
 
     subjects = SUBJECTS
     subject_results = []
@@ -91,7 +95,7 @@ def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=6
         X_sub, Y_sub = load_subject_train_val(base_folder, SID)
         print(f"Subject {SID} data: {X_sub.shape}, labels: {np.unique(Y_sub, return_counts=True)}")
 
-        kf = KFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+        kf = KFold(n_splits=args.n_folds, shuffle=(args.split_mode == 'ours'), random_state=args.seed)
         fold_metrics = []
         best_fold_acc = -np.inf
         best_fold_ckpt = None
@@ -101,46 +105,70 @@ def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=6
             x_train, y_train = X_sub[train_idx], Y_sub[train_idx]
             x_val, y_val = X_sub[val_idx], Y_sub[val_idx]
 
-            train_loader = DataLoader(
-                BasicDataset(x_train, y_train), batch_size=batch_size, shuffle=True,
-                num_workers=args.workers, pin_memory=True
-            )
-            val_loader = DataLoader(
-                BasicDataset(x_val, y_val), batch_size=batch_size, shuffle=False,
-                num_workers=args.workers, pin_memory=True
-            )
+            if args.split_mode == 'github':
+                # GitHub FAST baseline: full-batch training, no validation selection
+                train_loader = DataLoader(
+                    BasicDataset(x_train, y_train), batch_size=len(x_train), shuffle=True,
+                    num_workers=args.workers, pin_memory=True
+                )
+                val_loader = DataLoader(
+                    BasicDataset(x_val, y_val), batch_size=len(x_val), shuffle=False,
+                    num_workers=args.workers, pin_memory=True
+                )
+            else:
+                train_loader = DataLoader(
+                    BasicDataset(x_train, y_train), batch_size=batch_size, shuffle=True,
+                    num_workers=args.workers, pin_memory=True
+                )
+                val_loader = DataLoader(
+                    BasicDataset(x_val, y_val), batch_size=batch_size, shuffle=False,
+                    num_workers=args.workers, pin_memory=True
+                )
 
             model = EEG_Encoder_Module(config, max_epochs, len(train_loader))
             history_cb = HistoryCallback()
 
             fold_dir = os.path.join(save_dir, f"sub-{SID}")
             os.makedirs(fold_dir, exist_ok=True)
-            ckpt_cb = ModelCheckpoint(
-                dirpath=fold_dir,
-                filename=f"fold-{fold_idx}-best",
-                monitor="val_acc",
-                mode="max",
-                save_top_k=1,
-                verbose=False
-            )
+            ckpt_cb = None
+            if args.split_mode == 'ours':
+                ckpt_cb = ModelCheckpoint(
+                    dirpath=fold_dir,
+                    filename=f"fold-{fold_idx}-best",
+                    monitor="val_acc",
+                    mode="max",
+                    save_top_k=1,
+                    verbose=False
+                )
+
+            callbacks = [history_cb]
+            if ckpt_cb is not None:
+                callbacks.append(ckpt_cb)
 
             trainer = pl.Trainer(
                 strategy='auto',
                 accelerator='gpu',
                 devices=[args.gpu],
                 max_epochs=max_epochs,
-                callbacks=[history_cb, ckpt_cb],
+                callbacks=callbacks,
                 enable_progress_bar=True,
-                enable_checkpointing=True,
+                enable_checkpointing=(ckpt_cb is not None),
                 precision=args.precision,
                 logger=False,
                 num_sanity_val_steps=0
             )
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+            if args.split_mode == 'github':
+                trainer.fit(model, train_dataloaders=train_loader)
+            else:
+                trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-            fold_best = float(ckpt_cb.best_model_score) if ckpt_cb.best_model_score is not None else float('nan')
-            fold_metrics.append([fold_idx, fold_best])
+            if args.split_mode == 'github':
+                fold_best = float('nan')
+                fold_metrics.append([fold_idx, fold_best])
+            else:
+                fold_best = float(ckpt_cb.best_model_score) if ckpt_cb and ckpt_cb.best_model_score is not None else float('nan')
+                fold_metrics.append([fold_idx, fold_best])
 
             # Save fold learning curves
             if all(len(v) > 0 for v in history_cb.history.values()):
@@ -179,59 +207,81 @@ def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=6
 
             print(f"  Fold {fold_idx+1}: best val_acc={fold_best:.4f}")
 
-            if ckpt_cb.best_model_path and fold_best > best_fold_acc:
+            if args.split_mode == 'ours' and ckpt_cb and ckpt_cb.best_model_path and fold_best > best_fold_acc:
                 best_fold_acc = fold_best
                 best_fold_ckpt = ckpt_cb.best_model_path
                 best_train_len = len(train_loader)
 
-        # Load best fold model for this subject
-        if best_fold_ckpt:
-            best_model = EEG_Encoder_Module.load_from_checkpoint(
-                best_fold_ckpt,
-                config=config,
-                max_epochs=max_epochs,
-                niter_per_ep=best_train_len,
-                weights_only=False
-            )
-            subj_best_path = os.path.join(save_dir, f"sub-{SID}", "best_subject.pth")
-            torch.save(best_model.model.state_dict(), subj_best_path)
-            print(f"Saved best model for subject {SID} -> {subj_best_path}")
-        else:
-            print(f"No checkpoint found for subject {SID}; skipping save.")
-            continue
+        if args.split_mode == 'ours':
+            # Load best fold model for this subject
+            if best_fold_ckpt:
+                best_model = EEG_Encoder_Module.load_from_checkpoint(
+                    best_fold_ckpt,
+                    config=config,
+                    max_epochs=max_epochs,
+                    niter_per_ep=best_train_len,
+                    weights_only=False
+                )
+                subj_best_path = os.path.join(save_dir, f"sub-{SID}", "best_subject.pth")
+                torch.save(best_model.model.state_dict(), subj_best_path)
+                print(f"Saved best model for subject {SID} -> {subj_best_path}")
+            else:
+                print(f"No checkpoint found for subject {SID}; skipping save.")
+                continue
 
-        # Evaluate on official test set
-        test_acc = np.nan
-        test_f1 = np.nan
-        if SID in test_per_subject:
-            X_test, Y_test = test_per_subject[SID]
-            test_loader = DataLoader(
-                BasicDataset(X_test, Y_test), batch_size=batch_size, shuffle=False,
-                num_workers=args.workers, pin_memory=True
-            )
-            y_pred, y_true = inference_on_loader(best_model.model, test_loader)
-            test_acc = accuracy_score(y_true, y_pred)
-            test_f1 = f1_score(y_true, y_pred, average='macro')
+            # Evaluate on official test set
+            test_acc = np.nan
+            test_f1 = np.nan
+            if SID in test_per_subject:
+                X_test, Y_test = test_per_subject[SID]
+                test_loader = DataLoader(
+                    BasicDataset(X_test, Y_test), batch_size=batch_size, shuffle=False,
+                    num_workers=args.workers, pin_memory=True
+                )
+                y_pred, y_true = inference_on_loader(best_model.model, test_loader)
+                test_acc = accuracy_score(y_true, y_pred)
+                test_f1 = f1_score(y_true, y_pred, average='macro')
+                np.savetxt(
+                    os.path.join(save_dir, f"sub-{SID}", "test_predictions.csv"),
+                    np.array([y_pred, y_true]).T, delimiter=',', fmt='%d', header='Predicted,True'
+                )
+                print(f"Test Acc={test_acc:.4f}, Test F1={test_f1:.4f}")
+                global_pred.append(y_pred)
+                global_true.append(y_true)
+
+            subject_results.append([SID, best_fold_acc, test_acc, test_f1])
+        else:
+            # GitHub FAST baseline: evaluate on KFold held-out fold only
+            y_pred, y_true = inference_on_loader(model.model, val_loader)
+            fold_acc = accuracy_score(y_true, y_pred)
+            fold_f1 = f1_score(y_true, y_pred, average='macro')
+            fold_metrics.append([fold_idx, fold_acc])
             np.savetxt(
-                os.path.join(save_dir, f"sub-{SID}", "test_predictions.csv"),
+                os.path.join(save_dir, f"sub-{SID}", f"fold-{fold_idx}_predictions.csv"),
                 np.array([y_pred, y_true]).T, delimiter=',', fmt='%d', header='Predicted,True'
             )
-            print(f"Test Acc={test_acc:.4f}, Test F1={test_f1:.4f}")
-            global_pred.append(y_pred)
-            global_true.append(y_true)
+            print(f"  Fold {fold_idx+1}: Acc={fold_acc:.4f}, F1={fold_f1:.4f}")
 
-        subject_results.append([SID, best_fold_acc, test_acc, test_f1])
+        if args.split_mode == 'github':
+            # For github mode, summarize mean fold accuracy only
+            df_folds = pd.DataFrame(fold_metrics, columns=['Fold', 'Acc'])
+            df_folds.to_csv(os.path.join(save_dir, f"sub-{SID}", "fold_metrics.csv"), index=False)
+            subject_results.append([SID, df_folds['Acc'].mean(), np.nan, np.nan])
 
-        # Save fold metrics
-        df_folds = pd.DataFrame(fold_metrics, columns=['Fold', 'Best_Val_Acc'])
-        df_folds.to_csv(os.path.join(save_dir, f"sub-{SID}", "fold_metrics.csv"), index=False)
+        if args.split_mode == 'ours':
+            # Save fold metrics
+            df_folds = pd.DataFrame(fold_metrics, columns=['Fold', 'Best_Val_Acc'])
+            df_folds.to_csv(os.path.join(save_dir, f"sub-{SID}", "fold_metrics.csv"), index=False)
 
     # Save overall summary
-    df_subjects = pd.DataFrame(subject_results, columns=['Subject', 'Best_Val_Acc', 'Test_Acc', 'Test_F1'])
+    if args.split_mode == 'github':
+        df_subjects = pd.DataFrame(subject_results, columns=['Subject', 'Mean_Fold_Acc', 'Test_Acc', 'Test_F1'])
+    else:
+        df_subjects = pd.DataFrame(subject_results, columns=['Subject', 'Best_Val_Acc', 'Test_Acc', 'Test_F1'])
     df_subjects.to_csv(os.path.join(save_dir, "summary_per_subject.csv"), index=False)
 
     # Global predictions
-    if global_pred and global_true:
+    if args.split_mode == 'ours' and global_pred and global_true:
         gp = np.concatenate(global_pred)
         gt = np.concatenate(global_true)
         np.savetxt(
@@ -242,16 +292,24 @@ def finetune_per_subject_cv(config, args, save_dir, max_epochs=200, batch_size=6
     # Global subjects accuracy plot
     if not df_subjects.empty:
         plt.figure(figsize=(12, 6))
-        bars = plt.bar(df_subjects['Subject'], df_subjects['Test_Acc'], color='skyblue', edgecolor='black')
-        mean_acc = df_subjects['Test_Acc'].mean()
+        if args.split_mode == 'github':
+            bars = plt.bar(df_subjects['Subject'], df_subjects['Mean_Fold_Acc'], color='skyblue', edgecolor='black')
+            mean_acc = df_subjects['Mean_Fold_Acc'].mean()
+            plt.title('Mean KFold Accuracy per Subject (GitHub Baseline)', fontsize=14)
+            plt.ylabel('Accuracy', fontsize=12)
+            plt.ylim(0, max(df_subjects['Mean_Fold_Acc'].max(), mean_acc) * 1.15)
+        else:
+            bars = plt.bar(df_subjects['Subject'], df_subjects['Test_Acc'], color='skyblue', edgecolor='black')
+            mean_acc = df_subjects['Test_Acc'].mean()
+            plt.title('Test Accuracy per Subject (Finetune CV)', fontsize=14)
+            plt.ylabel('Accuracy', fontsize=12)
+            plt.ylim(0, max(df_subjects['Test_Acc'].max(), mean_acc) * 1.15)
+
         plt.axhline(y=mean_acc, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_acc:.4f}')
         for bar in bars:
             height = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2, height, f"{height:.2f}", ha='center', va='bottom', fontsize=9)
-        plt.title('Test Accuracy per Subject (Finetune CV)', fontsize=14)
         plt.xlabel('Subject ID', fontsize=12)
-        plt.ylabel('Accuracy', fontsize=12)
-        plt.ylim(0, max(df_subjects['Test_Acc'].max(), mean_acc) * 1.15)
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, "global_subject_accuracy.png"))
@@ -271,13 +329,15 @@ def main():
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID')
     parser.add_argument('--workers', type=int, default=4, help='Dataloader workers')
     parser.add_argument('--epochs', type=int, default=200, help='Max training epochs')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size (ignored in github mode)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--n_folds', type=int, default=5, help='Number of CV folds')
     parser.add_argument('--precision', type=str, default='bf16-mixed', help='Training precision')
     parser.add_argument('--data_folder', type=str, default='BCIC2020Track3', help='Data folder path')
     parser.add_argument('--excel_path', type=str, default=None, help='Test labels Excel path')
     parser.add_argument('--output_dir', type=str, default='results/finetune_official/FAST', help='Output directory')
+    parser.add_argument('--split_mode', type=str, default='github', choices=['github', 'ours'],
+                        help='Match GitHub FAST baseline or our stricter split')
     args = parser.parse_args()
 
     # Load config if provided
