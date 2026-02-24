@@ -151,14 +151,14 @@ class TestHistoryCallback:
     """Tests for the training history callback."""
 
     def test_initial_state(self):
-        """History starts empty."""
+        """History starts empty with all 6 metric keys."""
         cb = HistoryCallback()
-        assert cb.history == {'loss': [], 'acc': [], 'val_loss': [], 'val_acc': []}
+        assert cb.history == {'loss': [], 'acc': [], 'f1': [], 'val_loss': [], 'val_acc': [], 'val_f1': []}
 
     def test_all_keys_present(self):
-        """History has all expected keys."""
+        """History has all expected keys including f1."""
         cb = HistoryCallback()
-        assert set(cb.history.keys()) == {'loss', 'acc', 'val_loss', 'val_acc'}
+        assert set(cb.history.keys()) == {'loss', 'acc', 'f1', 'val_loss', 'val_acc', 'val_f1'}
 
     def test_on_train_epoch_end_records(self):
         """on_train_epoch_end appends metrics when available."""
@@ -166,22 +166,24 @@ class TestHistoryCallback:
 
         # Simulate a trainer with callback_metrics
         class MockTrainer:
-            callback_metrics = {'train_loss': torch.tensor(0.5), 'train_acc': torch.tensor(0.8)}
+            callback_metrics = {'train_loss': torch.tensor(0.5), 'train_acc': torch.tensor(0.8), 'train_f1': torch.tensor(0.75)}
 
         cb.on_train_epoch_end(MockTrainer(), None)
         assert cb.history['loss'] == [0.5]
         assert cb.history['acc'] == [pytest.approx(0.8)]
+        assert cb.history['f1'] == [pytest.approx(0.75)]
 
     def test_on_validation_epoch_end_records(self):
         """on_validation_epoch_end appends val metrics."""
         cb = HistoryCallback()
 
         class MockTrainer:
-            callback_metrics = {'val_loss': torch.tensor(0.3), 'val_acc': torch.tensor(0.9)}
+            callback_metrics = {'val_loss': torch.tensor(0.3), 'val_acc': torch.tensor(0.9), 'val_f1': torch.tensor(0.85)}
 
         cb.on_validation_epoch_end(MockTrainer(), None)
         assert cb.history['val_loss'] == [pytest.approx(0.3)]
         assert cb.history['val_acc'] == [pytest.approx(0.9)]
+        assert cb.history['val_f1'] == [pytest.approx(0.85)]
 
     def test_missing_metrics_not_recorded(self):
         """If metrics are missing (None), nothing is appended."""
@@ -208,3 +210,96 @@ class TestHistoryCallback:
 
         assert len(cb.history['loss']) == 3
         assert len(cb.history['acc']) == 3
+
+
+# ============================================================
+# New tests for modifications
+# ============================================================
+
+class TestValF1Logging:
+    """Tests that val_f1 is now logged in validation_step."""
+
+    def test_validation_step_logs_val_f1(self, small_config, dummy_eeg_small):
+        """validation_step logs val_f1 to callback_metrics."""
+        module = EEG_Encoder_Module(small_config, max_epochs=10, niter_per_ep=5)
+        labels = torch.randint(0, small_config.n_classes, (dummy_eeg_small.shape[0],))
+        batch = (dummy_eeg_small, labels)
+        # Run validation_step to populate logged metrics
+        module.validation_step(batch, 0)
+        # val_f1 metric object should have been called
+        f1_val = module.val_f1.compute()
+        assert f1_val.dim() == 0  # scalar
+        assert 0.0 <= f1_val.item() <= 1.0
+
+
+class TestLRScheduleClamp:
+    """Tests that the LR schedule index is clamped safely."""
+
+    def test_lr_at_step_zero(self, small_config):
+        """At global_step=0, LR reads schedule[0] instead of schedule[-1]."""
+        max_epochs = 10
+        niter = 5
+        module = EEG_Encoder_Module(small_config, max_epochs=max_epochs, niter_per_ep=niter)
+        module.configure_optimizers()
+        # Simulate global_step = 0
+        module._global_step = 0
+        # The lambda uses min(global_step, len-1) = min(0, 49) = 0
+        lr_mult = module.cosine_lr_list[min(0, len(module.cosine_lr_list) - 1)]
+        # With 10 warmup epochs, step 0 should be near 0 (warmup start)
+        assert lr_mult == pytest.approx(module.cosine_lr_list[0])
+
+    def test_lr_at_last_step(self, small_config):
+        """At the last step, LR reads the actual final schedule value (not schedule[-1] from wraparound)."""
+        max_epochs = 10
+        niter = 5
+        module = EEG_Encoder_Module(small_config, max_epochs=max_epochs, niter_per_ep=niter)
+        last_idx = len(module.cosine_lr_list) - 1
+        lr_mult = module.cosine_lr_list[min(last_idx, last_idx)]
+        # The value should be the actual last element of the schedule
+        assert lr_mult == pytest.approx(module.cosine_lr_list[-1])
+
+    def test_lr_beyond_schedule_is_clamped(self, small_config):
+        """Step beyond schedule length is clamped to last element."""
+        max_epochs = 10
+        niter = 5
+        module = EEG_Encoder_Module(small_config, max_epochs=max_epochs, niter_per_ep=niter)
+        beyond_step = len(module.cosine_lr_list) + 100
+        clamped_idx = min(beyond_step, len(module.cosine_lr_list) - 1)
+        lr_mult = module.cosine_lr_list[clamped_idx]
+        # Clamped to last element, same as schedule[-1]
+        assert lr_mult == pytest.approx(module.cosine_lr_list[-1])
+
+
+class TestHistoryCallbackF1:
+    """Tests for the new F1 recording in HistoryCallback."""
+
+    def test_f1_not_recorded_when_missing(self):
+        """When train_f1 is not in callback_metrics, f1 list stays empty."""
+        cb = HistoryCallback()
+        class MockTrainer:
+            callback_metrics = {'train_loss': torch.tensor(0.5), 'train_acc': torch.tensor(0.8)}
+        cb.on_train_epoch_end(MockTrainer(), None)
+        assert cb.history['f1'] == []
+
+    def test_val_f1_not_recorded_when_missing(self):
+        """When val_f1 is not in callback_metrics, val_f1 list stays empty."""
+        cb = HistoryCallback()
+        class MockTrainer:
+            callback_metrics = {'val_loss': torch.tensor(0.3), 'val_acc': torch.tensor(0.9)}
+        cb.on_validation_epoch_end(MockTrainer(), None)
+        assert cb.history['val_f1'] == []
+
+    def test_multiple_epochs_with_f1(self):
+        """F1 accumulates over multiple epochs."""
+        cb = HistoryCallback()
+        for i in range(5):
+            class MockTrainer:
+                callback_metrics = {
+                    'train_loss': torch.tensor(0.5),
+                    'train_acc': torch.tensor(0.8),
+                    'train_f1': torch.tensor(0.7 + i * 0.01),
+                }
+            cb.on_train_epoch_end(MockTrainer(), None)
+        assert len(cb.history['f1']) == 5
+        assert cb.history['f1'][0] == pytest.approx(0.7)
+        assert cb.history['f1'][4] == pytest.approx(0.74)

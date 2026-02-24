@@ -49,9 +49,14 @@ class EEG_Encoder_Module(pl.LightningModule):
         self.optimizer = optim.AdamW(self.parameters(), lr=0.0005)
         self.scheduler = optim.lr_scheduler.LambdaLR(
             self.optimizer, 
-            lambda epoch: self.cosine_lr_list[self.global_step - 1]
+            lambda epoch: self.cosine_lr_list[min(self.global_step, len(self.cosine_lr_list) - 1)]
         )
         return [self.optimizer], [{'scheduler': self.scheduler, 'interval': 'step'}]
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Strip _orig_mod prefix added by torch.compile before loading."""
+        cleaned = {k.replace('._orig_mod', ''): v for k, v in state_dict.items()}
+        return super().load_state_dict(cleaned, strict=strict)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -76,6 +81,7 @@ class EEG_Encoder_Module(pl.LightningModule):
         
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_acc', acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_f1', f1, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
 
