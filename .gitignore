@@ -7,10 +7,9 @@ __pycache__/
 BCIC2020Track3/
 Processed/
 data/
-results/
 checkpoints/
 logs/
-Results/
+results/
 Results_*/
 debug_FAST_BCIC2020Track3.py
 shap_outputs*/
