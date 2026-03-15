@@ -128,20 +128,3 @@ results/finetune_official/FAST/
 
 In `--split_mode github`, summaries report mean fold accuracy only and no official
 test set files are produced.
-
-## Citation
-
-Please cite our paper if you find this work useful:
-
-```bibtex
-@article{jiang2025decoding,
-  title={Decoding Covert Speech from EEG Using a Functional Areas Spatio-Temporal Transformer},
-  author={Jiang, Muyun and Ding, Yi and Zhang, Wei and Teo, Kok Ann Colin and Fong, LaiGuan and Zhang, Shuailei and Guo, Zhiwei and Liu, Chenyu and Bhuvanakantham, Raghavan and Sim, Wei Khang Jeremy and others},
-  journal={arXiv preprint arXiv:2504.03762},
-  year={2025}
-}
-```
-
-## License
-
-This project is licensed under the CBCR License - see the [LICENSE](LICENSE) file for details.
