@@ -30,7 +30,7 @@ This report synthesises findings from three analysis notebooks and their saved a
 | 7 | B + C | 700 | 0.717 ± 0.123 | 0.272 ± 0.055 | 0.208 ± 0.072 |
 | 8 | Augmented + ES | 350 | 0.725 ± 0.068 | 0.620 ± 0.078 | 0.617 ± 0.077 |
 | 9 | Augmented (No ES) | 350 | 0.761 ± 0.052 | 0.675 ± 0.081 | 0.674 ± 0.084 |
-| 10 | Kaggle Replication | 350 | 0.733 ± 0.084 | 0.733 ± 0.084 | 0.732 ± 0.086 |
+| 10 | Full-Data Augmented (No Val Split) | 350 | 0.733 ± 0.084 | 0.733 ± 0.084 | 0.732 ± 0.086 |
 | 11 | High-pass 4 Hz | 350 | 0.436 ± 0.069 | 0.205 ± 0.040 | 0.129 ± 0.042 |
 
 > **Key evidence**: [comparison_summary.csv](../results/condition_experiments/comparison_summary.csv)
@@ -69,7 +69,7 @@ The following tables show individual subject performance for key runs, exposing 
 
 > Per-subject accuracy chart: [run1 global_subject_accuracy.png](../results/condition_experiments/run1_original/global_subject_accuracy.png)
 
-#### Run 10: Kaggle Replication — Best Overall
+#### Run 10: Full-Data Augmented Training (No Val Split) — Best Overall
 
 | Subject | Best Val Acc | Test Acc | Test F1 |
 |:-------:|:-----------:|:--------:|:-------:|
@@ -89,7 +89,7 @@ The following tables show individual subject performance for key runs, exposing 
 | 14 | 0.600 | 0.60 | 0.602 |
 | 15 | 0.840 | 0.84 | 0.839 |
 
-Note: Val Acc = Test Acc for Run 10 because the Kaggle replication uses KFold without a separate test set — the validation fold *is* the evaluation. This inflates apparent accuracy relative to Runs 1–9/11.
+Note: Val Acc = Test Acc for Run 10 because the official test set is passed as the validation monitor during training (there is no held-out validation fold — all 350 training trials are used). The recorded "Best_Val_Acc" is the final-epoch test accuracy. This makes Run 10 not directly comparable to Runs 1–9/11, which hold out a validation fold and evaluate on the official test set separately.
 
 > Per-subject accuracy chart: [run10 global_subject_accuracy.png](../results/condition_experiments/run10_kaggle_replication/global_subject_accuracy.png)
 
@@ -197,7 +197,7 @@ For reference, the original FAST GitHub codebase (KFold, no held-out test, full-
 
 **Run 7 exposes a generalisation gap.** Validation accuracy is high (0.717) with extreme variance (± 0.123), but test accuracy collapses to 0.272. This is the clearest overfitting signal in the study: models trained on only ICA-cleaned conditions learn patterns that do not transfer to the original-distribution test set.
 
-**Augmentation and Kaggle replication lead.** Run 10 (Kaggle replication, no separate val/test split) achieves 0.733 test accuracy. Run 9 (augmentation without early stopping) reaches 0.675, the best result among properly held-out test evaluations. The gap between Run 10 and all other runs is partly methodological — Run 10 uses a Kaggle-style KFold where the validation fold *is* the evaluation, inflating apparent accuracy.
+**Augmentation and full-data training lead.** Run 10 (full-data augmented training, no validation split) achieves 0.733 test accuracy. Run 9 (augmentation without early stopping) reaches 0.675, the best result among runs with properly held-out test evaluations. The gap is partly methodological — Run 10 trains on all available training data rather than a 4/5 fold subset, and the test set doubles as the validation monitor during training.
 
 **Strict high-pass filtering is destructive.** Run 11 (4 Hz high-pass) produces the worst result (0.205 test accuracy, 0.129 F1), confirming that sub-4 Hz content — whether neural or artifactual — is currently load-bearing for the model.
 
@@ -220,7 +220,7 @@ For reference, the original FAST GitHub codebase (KFold, no held-out test, full-
 | Run 7: B + C | 2.81e-3 | 6.92e-4 | Occipital |
 | Run 8: Augmented + ES | 4.02e-4 | 5.70e-5 | Pre-frontal |
 | Run 9: Augmented (No ES) | 4.30e-4 | 6.62e-5 | Pre-frontal |
-| Run 10: Kaggle Replication | 4.06e-4 | 6.21e-5 | Pre-frontal |
+| Run 10: Full-Data Augmented (No Val Split) | 4.06e-4 | 6.21e-5 | Pre-frontal |
 | Run 11: High-pass 4 Hz | 2.13e-4 | 2.63e-4 | Pre-central |
 
 > **Key evidence**: [shap_summary.csv](../results/shap_analysis/shap_summary.csv)
@@ -230,7 +230,7 @@ For reference, the original FAST GitHub codebase (KFold, no held-out test, full-
 **Magnitude scales with data volume and condition mixing.** The highest SHAP magnitudes belong to Run 7 (2.81e-3) and Run 6 (2.44e-3) — the multi-condition runs. Models trained on more data conditions produce stronger per-feature attributions, suggesting broader feature utilisation (or amplified reliance on a specific feature axis shared across conditions).
 
 **Top zone shifts with condition family.** There is a clear geographical bifurcation:
-- **Original / augmented / Kaggle runs** → Pre-frontal dominance (Runs 1, 8, 9, 10)
+- **Original / augmented / full-data runs** → Pre-frontal dominance (Runs 1, 8, 9, 10)
 - **Mixed ICA runs** → Occipital dominance (Runs 3, 4, 5, 6, 7)
 - **Strict high-pass** → Pre-central shift (Run 11)
 

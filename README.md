@@ -4,26 +4,31 @@ Code for paper: **Decoding Covert Speech from EEG Using a Functional Areas Spati
 
 This codebase reproduces results on the publicly available dataset [BCI Competition 2020 Track #3: Imagined Speech Classification](https://osf.io/pq7vb/).
 
-Contact: James Jiang Muyun (james.jiang@ntu.edu.sg)
-
 ## Project Structure
 
 ```
 FAST/
-├── src/
-│   └── fast/                    # Main package
-│       ├── models/              # FAST model architecture
-│       ├── data/                # Data loading and preprocessing
-│       ├── train/               # Training utilities
-│       └── utils.py             # Helper functions
+├── src/fast/                        # Main package
+│   ├── models/                      # FAST model architecture
+│   ├── data/                        # Data loading and preprocessing
+│   ├── train/                       # Training utilities
+│   ├── analysis/                    # SHAP comparison helpers
+│   └── utils.py                     # Helper functions
 ├── scripts/
-│   ├── train_fast.py            # Training script
-│   ├── benchmark.py             # Evaluation script
-│   └── preprocess.py            # Data preprocessing
+│   ├── train_fast.py                # Main training script (FAST)
+│   ├── train_fast_baseline.py       # Baseline variant
+│   ├── train_tsception.py           # TSception comparison
+│   ├── benchmark.py                 # Metrics aggregation
+│   ├── preprocess.py                # Raw data → HDF5
+│   ├── explain_fast.py              # SHAP explanations
+│   ├── artifact_analysis.py         # ICA-based artifact analysis
+│   └── global_shap_analysis.py      # Dataset-wide SHAP
 ├── configs/
-│   └── default.yaml             # Configuration file
-├── notebooks/                   # Jupyter notebooks
-└── tests/                       # Unit tests
+│   └── default.yaml                 # Model and training configuration
+├── docs/                            # Analysis reports
+├── notebooks/                       # Jupyter notebooks (exploratory analysis)
+├── results/                         # Experiment outputs (not tracked by git)
+└── tests/                           # Unit tests
 ```
 
 ## Installation
@@ -128,3 +133,17 @@ results/finetune_official/FAST/
 
 In `--split_mode github`, summaries report mean fold accuracy only and no official
 test set files are produced.
+
+## Evaluation Protocol and Run 10 vs Run 9
+
+**Runs 1–9, 11** use shuffled 5-fold cross-validation. One fold is held out as validation for model selection, and the official BCI Competition test set is evaluated separately at the end. Val Acc and Test Acc are measured on different data.
+
+**Run 10 (Full-Data Augmented Training, No Val Split)** is a distinct protocol. All 350 training trials are used directly for training with no held-out fold. The official test set is passed as the validation monitor during training (for learning curve logging only — no early stopping is applied). Test Acc is therefore evaluated on the full official test set, but the model had access to the test set's accuracy signal throughout training. Val Acc equals Test Acc by construction because both are measured on the same set.
+
+Run 10 also differs in: batch size 16 (vs 64), FP32 precision (vs bf16-mixed), and data augmentation.
+
+Run 10 achieves 73.3% and Run 9 achieves 67.5%. **These numbers are not directly comparable.** Run 9 is the appropriate result for out-of-sample generalisation. The gap reflects both the protocol difference and the larger effective training set in Run 10.
+
+## License
+
+This project is licensed under the CBCR License - see the [LICENSE](LICENSE) file for details.

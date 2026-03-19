@@ -62,7 +62,7 @@ EXPERIMENT_NAME_ALIASES = {
     "Run 8: Augmentations + Cool Down": "run8_augment",
     "Run 9: Augmented No ES": "run9_augment_no_es",
     "Run 9: Augmentations (No Early Stopping)": "run9_augment_no_es",
-    "Run 10: Kaggle Replication": "run10_kaggle",
+    "Run 10: Full-Data Augmented Training (No Val Split)": "run10_kaggle",
     "Run 11: High-pass 4 Hz": "run11_highpass4",
 }
 
@@ -189,7 +189,7 @@ def default_experiments(project_root: str | Path) -> dict[str, ExperimentSpec]:
         ),
         "run10_kaggle": ExperimentSpec(
             run_key="run10_kaggle",
-            display_name="Run 10: Kaggle Replication",
+            display_name="Run 10: Full-Data Augmented Training (No Val Split)",
             results_dir_name="run10_kaggle_replication",
             checkpoint_name="final_model.pth",
             h5_paths=(processed / "BCIC2020Track3.h5",),
