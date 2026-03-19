@@ -1,0 +1,41 @@
+"""Analysis helpers for comparative FAST experiments."""
+
+from .shap_comparison import (
+    DEFAULT_BANDS,
+    DEFAULT_FOCUS_RUNS,
+    EXPERIMENT_NAME_ALIASES,
+    LANGUAGE_ZONE_GROUPS,
+    ExperimentSpec,
+    build_subject_summary_tables,
+    compare_matched_runs,
+    compute_band_time_matrix,
+    compute_shap_values,
+    compute_zone_time_matrix,
+    default_experiments,
+    default_model_config,
+    load_experiment_performance_table,
+    load_model,
+    load_subject_data,
+    summarise_language_groups,
+    zone_indices,
+)
+
+__all__ = [
+    "DEFAULT_BANDS",
+    "DEFAULT_FOCUS_RUNS",
+    "EXPERIMENT_NAME_ALIASES",
+    "LANGUAGE_ZONE_GROUPS",
+    "ExperimentSpec",
+    "build_subject_summary_tables",
+    "compare_matched_runs",
+    "compute_band_time_matrix",
+    "compute_shap_values",
+    "compute_zone_time_matrix",
+    "default_experiments",
+    "default_model_config",
+    "load_experiment_performance_table",
+    "load_model",
+    "load_subject_data",
+    "summarise_language_groups",
+    "zone_indices",
+]
